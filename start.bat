@@ -76,7 +76,8 @@ echo   3. 配好 PotPlayer 路径后，点海报进详情页即可播放
 echo.
 echo 想验证整个项目是否健康，可双击 verify.bat。
 echo.
-if not defined MM_NO_PAUSE pause
+rem 成功后立即关闭控制台，只保留软件主界面（不再停留 pause 黑窗）；
+rem 出错路径仍会停在控制台，便于查看错误。
 exit /b 0
 
 rem ------------------------------------------------------------------ 子过程

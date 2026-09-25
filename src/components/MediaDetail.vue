@@ -86,7 +86,7 @@ function pick(it: TmdbSearchItem): void {
     <header class="head" :style="backdrop ? { backgroundImage: `url(${backdrop})` } : {}">
       <div class="shade"></div>
       <div class="head-inner">
-        <img v-if="poster" class="poster" :src="poster" :alt="detail.media.title" />
+        <img v-if="poster" class="poster" :src="poster" :alt="detail.media.display_title" />
         <div v-else class="poster ph">{{ detail.media.type === "tv" ? "📺" : "🎬" }}</div>
         <div class="info">
           <h2>{{ detail.media.display_title }}</h2>
@@ -185,77 +185,55 @@ function pick(it: TmdbSearchItem): void {
 
 <style scoped>
 .detail { display: flex; flex-direction: column; gap: calc(var(--space) * 5); }
-.back {
-  align-self: flex-start; padding: 6px 0; border: 0; background: none;
-  color: var(--muted); font-size: 13px; cursor: pointer;
-}
+.back { align-self: flex-start; padding: 4px 0; border: 0; background: none; color: var(--muted); font-size: var(--fs-13); cursor: pointer; }
 .back:hover { color: var(--text); }
 
 .head {
-  position: relative; border-radius: 10px; overflow: hidden; background-color: var(--surface);
-  background-size: cover; background-position: center;
+  position: relative; border-radius: var(--radius-l); overflow: hidden;
+  background-color: var(--surface); background-size: cover; background-position: center;
+  border: 1px solid var(--border);
 }
-.shade {
-  position: absolute; inset: 0;
-  background: linear-gradient(90deg, rgba(20,20,20,.96) 0%, rgba(20,20,20,.84) 55%, rgba(20,20,20,.55) 100%);
-}
-.head-inner {
-  position: relative; display: flex; gap: calc(var(--space) * 5);
-  padding: calc(var(--space) * 6); align-items: flex-start;
-}
-.poster { width: 165px; border-radius: 8px; flex: none; display: block; }
-.poster.ph {
-  aspect-ratio: 2 / 3; display: flex; align-items: center; justify-content: center;
-  font-size: 40px; background: rgba(255,255,255,.06);
-}
-.info { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-h2 { margin: 0; font-size: 24px; line-height: 1.25; }
-.line { display: flex; flex-wrap: wrap; gap: 10px; margin: 0; font-size: 13px; color: var(--muted); }
-.tag { padding: 1px 7px; border-radius: 4px; background: var(--accent); color: #fff; font-size: 12px; }
-.score { color: #f5c518; }
-.overview { margin: 0; font-size: 14px; line-height: 1.7; color: #ddd; max-width: 70ch; }
-.file { margin: 0; font-size: 12px; color: var(--muted); word-break: break-all; }
+.shade { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(19,19,21,.96) 0%, rgba(19,19,21,.85) 55%, rgba(19,19,21,.6) 100%); }
+.head-inner { position: relative; display: flex; gap: calc(var(--space) * 6); padding: calc(var(--space) * 7); align-items: flex-start; }
+.poster { width: 170px; border-radius: var(--radius); flex: none; display: block; border: 1px solid var(--border); }
+.poster.ph { aspect-ratio: 2 / 3; display: flex; align-items: center; justify-content: center; font-size: 40px; background: rgba(255,255,255,.05); }
+.info { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+h2 { margin: 0; font-size: var(--fs-24); line-height: 1.25; }
+.line { display: flex; flex-wrap: wrap; gap: 10px; margin: 0; font-size: var(--fs-13); color: var(--muted); align-items: center; }
+.tag { padding: 2px 8px; border-radius: 4px; background: var(--accent); color: #fff; font-size: var(--fs-12); font-weight: 600; }
+.score { color: var(--score); font-weight: 600; }
+.overview { margin: 0; font-size: var(--fs-14); line-height: 1.75; color: var(--text-2); max-width: 72ch; }
+.file { margin: 0; font-size: var(--fs-12); color: var(--muted); word-break: break-all; }
 
 .actions { display: flex; flex-wrap: wrap; gap: 10px; }
-.btn {
-  padding: 8px 14px; border: 0; border-radius: 6px; cursor: pointer; font-size: 13px;
-  background: rgba(255,255,255,.9); color: #111;
-}
-.btn.primary { background: var(--accent); color: #fff; }
-.btn.ghost { background: rgba(255,255,255,.12); color: var(--text); }
-.btn.danger { background: rgba(229,9,20,.16); color: #ff6b73; }
-.btn.small { padding: 5px 10px; font-size: 12px; }
-.btn:disabled { opacity: .6; cursor: default; }
+.btn { padding: 9px 16px; border-radius: var(--radius-s); cursor: pointer; font-size: var(--fs-13); background: var(--surface-2); color: var(--text); border: 1px solid var(--border); transition: background .15s ease, opacity .15s ease; }
+.btn:hover { background: var(--border-strong); }
+.btn.primary { background: var(--accent); color: #fff; border-color: transparent; }
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.danger { background: var(--accent-soft); color: var(--danger); border-color: transparent; }
+.btn.small { padding: 6px 11px; font-size: var(--fs-12); }
+.btn:disabled { opacity: .55; cursor: default; }
 
 .match { display: flex; flex-direction: column; gap: 10px; }
 .match-row { display: flex; gap: 8px; }
-.match-row input {
-  flex: 1; padding: 8px 10px; border-radius: 6px; font-size: 13px;
-  border: 1px solid rgba(255,255,255,.14); background: var(--surface); color: var(--text);
-}
-.match-msg { margin: 0; font-size: 13px; color: var(--muted); }
+.match-row input { flex: 1; }
+.match-msg { margin: 0; font-size: var(--fs-13); color: var(--muted); }
 .results { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-.results li {
-  display: flex; align-items: center; gap: 12px; padding: 8px;
-  border-radius: 8px; background: var(--surface);
-}
-.results img { width: 44px; border-radius: 4px; flex: none; }
+.results li { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: var(--radius-s); background: var(--surface); border: 1px solid var(--border); }
+.results img { width: 46px; border-radius: 4px; flex: none; }
 .r-info { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.r-title { font-size: 14px; }
-.r-sub { display: flex; gap: 10px; font-size: 12px; color: var(--muted); }
-.r-id { opacity: .7; }
+.r-title { font-size: var(--fs-14); font-weight: 550; }
+.r-sub { display: flex; gap: 10px; font-size: var(--fs-12); color: var(--muted); }
+.r-id { opacity: .65; }
 
 .episodes { display: flex; flex-direction: column; gap: calc(var(--space) * 5); }
-.episodes.empty { color: var(--muted); font-size: 13px; }
-h3 { margin: 0 0 8px; font-size: 15px; color: var(--muted); font-weight: 600; }
-.season ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-.season li {
-  display: flex; align-items: center; gap: 12px; padding: 7px 10px;
-  border-radius: 6px; background: var(--surface);
-}
-.ep-no { flex: none; width: 34px; font-size: 12px; color: var(--muted); }
-.ep-thumb { width: 56px; border-radius: 4px; flex: none; display: block; }
+.episodes.empty { color: var(--muted); font-size: var(--fs-13); }
+h3 { margin: 0 0 10px; font-size: var(--fs-15); color: var(--muted); font-weight: 650; }
+.season ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.season li { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-radius: var(--radius-s); background: var(--surface); border: 1px solid var(--border); }
+.ep-no { flex: none; width: 34px; font-size: var(--fs-12); color: var(--muted); font-weight: 600; }
+.ep-thumb { width: 60px; border-radius: 4px; flex: none; display: block; }
 .ep-main { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.ep-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ep-date { font-size: 11px; color: var(--muted); }
+.ep-title { font-size: var(--fs-13); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ep-date { font-size: var(--fs-12); color: var(--muted); }
 </style>

@@ -41,10 +41,11 @@ const score = computed(() =>
 }
 .poster {
   position: relative; aspect-ratio: 2 / 3; width: 100%; overflow: hidden;
-  border-radius: 8px; background: var(--surface);
+  border-radius: var(--radius); background: var(--surface);
+  border: 1px solid var(--border);
   transition: transform .18s ease, box-shadow .18s ease;
 }
-.card:hover .poster { transform: translateY(-3px); box-shadow: 0 8px 22px rgba(0, 0, 0, .45); }
+.card:hover .poster { transform: translateY(-3px); box-shadow: var(--shadow); }
 .poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .placeholder {
   width: 100%; height: 100%; display: flex; flex-direction: column;
@@ -65,8 +66,8 @@ const score = computed(() =>
   display: flex; align-items: center; justify-content: center; border-radius: 50%;
   font-size: 12px; background: var(--accent); color: #fff;
 }
-.meta { display: flex; flex-direction: column; gap: 2px; }
-.title { font-size: 13px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sub { display: flex; gap: 8px; font-size: 12px; color: var(--muted); }
-.score { color: #f5c518; }
+.meta { display: flex; flex-direction: column; gap: 2px; padding: 0 2px; }
+.title { font-size: var(--fs-13); line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub { display: flex; gap: 8px; font-size: var(--fs-12); color: var(--muted); }
+.score { color: var(--score); }
 </style>

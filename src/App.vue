@@ -54,10 +54,10 @@ onMounted(async () => {
           class="search"
           placeholder="搜索标题 / 类型 / 年份"
         />
-        <button class="btn primary" :disabled="media.scanning" @click="media.scan()">
+        <button class="btn btn-primary" :disabled="media.scanning" @click="media.scan()">
           {{ media.scanning ? "扫描中…" : "扫描媒体库" }}
         </button>
-        <button class="btn" :disabled="media.scraping" @click="media.scrapeMissing()">
+        <button class="btn btn-ghost" :disabled="media.scraping" @click="media.scrapeMissing()">
           {{ media.scraping ? "刮削中…" : "批量刮削" }}
         </button>
       </header>
@@ -74,31 +74,29 @@ onMounted(async () => {
 
 <style scoped>
 .layout { display: flex; height: 100vh; }
-.content { flex: 1; overflow-y: auto; padding: calc(var(--space) * 4) calc(var(--space) * 6); }
+.content { flex: 1; overflow-y: auto; padding: calc(var(--space) * 5) calc(var(--space) * 7) calc(var(--space) * 10); }
 
 .topbar {
-  display: flex; align-items: center; gap: 10px; margin-bottom: calc(var(--space) * 4);
-  position: sticky; top: 0; z-index: 5; padding: calc(var(--space) * 2) 0;
+  display: flex; align-items: center; gap: 10px; margin-bottom: calc(var(--space) * 5);
+  position: sticky; top: 0; z-index: 5; padding: calc(var(--space) * 3) 0;
   background: var(--bg);
 }
-h1 { flex: 1; margin: 0; font-size: 18px; font-weight: 600; }
+h1 { flex: 1; margin: 0; font-size: var(--fs-18); font-weight: 650; }
 .search {
-  width: 220px; padding: 8px 10px; border-radius: 6px; font-size: 13px;
-  border: 1px solid rgba(255,255,255,.14); background: var(--surface); color: var(--text);
+  width: 240px; padding: 9px 12px; border-radius: var(--radius-s); font-size: var(--fs-13);
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  outline: none; transition: border-color 0.15s ease;
 }
-.btn {
-  padding: 8px 14px; border: 0; border-radius: 6px; cursor: pointer; font-size: 13px;
-  background: rgba(255,255,255,.12); color: var(--text); white-space: nowrap;
-}
-.btn.primary { background: var(--accent); color: #fff; }
-.btn:disabled { opacity: .6; cursor: default; }
+.search:focus { border-color: var(--accent); }
+.search::placeholder { color: var(--muted); }
 
 .toast {
-  margin: 0 0 calc(var(--space) * 4); padding: 9px 12px; border-radius: 6px;
-  font-size: 13px; background: rgba(255,255,255,.07); color: #ddd;
+  margin: 0 0 calc(var(--space) * 4); padding: 10px 14px; border-radius: var(--radius-s);
+  font-size: var(--fs-13); background: var(--surface); border: 1px solid var(--border); color: var(--text-2);
 }
 .err {
-  margin: 0 0 calc(var(--space) * 4); padding: 9px 12px; border-radius: 6px;
-  font-size: 13px; background: rgba(229,9,20,.14); color: #ff8a90; word-break: break-all;
+  margin: 0 0 calc(var(--space) * 4); padding: 10px 14px; border-radius: var(--radius-s);
+  font-size: var(--fs-13); background: var(--accent-soft); border: 1px solid rgba(229,9,20,.35);
+  color: #ff8a90; word-break: break-all;
 }
 </style>
