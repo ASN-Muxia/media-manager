@@ -14,7 +14,7 @@ use tauri::{AppHandle, Manager};
 const DB_FILE: &str = "media.db";
 
 /// 建表语句（幂等，可重复执行）。
-const SCHEMA: &str = r#"
+pub const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -69,11 +69,21 @@ CREATE TABLE IF NOT EXISTS scan_history (
 
 CREATE INDEX IF NOT EXISTS idx_media_type        ON media(type);
 CREATE INDEX IF NOT EXISTS idx_media_tmdb        ON media(tmdb_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_media_path ON media(file_path) WHERE file_path IS NOT NULL;
+-- file_path 用普通唯一索引：SQLite 中 NULL 互不冲突，因此剧集主记录（file_path 为 NULL）可多条共存，
+-- 同时让 `ON CONFLICT(file_path)` upsert 生效。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_media_path ON media(file_path);
 CREATE INDEX IF NOT EXISTS idx_episodes_media    ON episodes(media_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_path ON episodes(file_path) WHERE file_path IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_path ON episodes(file_path);
 CREATE INDEX IF NOT EXISTS idx_scan_path         ON scan_history(path);
 "#;
+
+/// 当前 Unix 时间戳（秒）。
+pub fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// 应用数据目录（不存在则创建）。
 pub fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {

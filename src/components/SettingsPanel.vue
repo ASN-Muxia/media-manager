@@ -1,24 +1,36 @@
 <script setup lang="ts">
 /**
- * 设置面板（模块② 最小可用版：验证设置持久化打通）。
- * 模块⑧ 再补：原生目录选择器、主题、语言等。
+ * 设置面板：媒体目录、TMDB Key、PotPlayer 路径、扫描与维护。
+ * 目录选择器（原生 dialog 插件）留待后续版本。
  */
 import { onMounted, ref } from "vue";
+import { dbInfo, detectPlayer } from "../api/commands";
 import { useSettingsStore } from "../stores/settingsStore";
-import { dbInfo } from "../api/commands";
+import { useMediaStore } from "../stores/mediaStore";
 
 const store = useSettingsStore();
+const media = useMediaStore();
+
 const newDir = ref("");
 const status = ref("");
 const tables = ref<string[]>([]);
+const player = ref<string | null>(null);
+const probing = ref(false);
+
+function fmtTime(ts: number | null): string {
+  if (!ts) return "-";
+  return new Date(ts * 1000).toLocaleString();
+}
 
 onMounted(async () => {
   if (!store.loaded) await store.load();
+  await media.loadHistory();
   try {
     tables.value = (await dbInfo()).tables;
   } catch {
     tables.value = [];
   }
+  void probePlayer();
 });
 
 function addDir(): void {
@@ -43,6 +55,31 @@ async function onReload(): Promise<void> {
   await store.load();
   status.value = "↻ 已从数据库重新加载";
 }
+
+async function probePlayer(): Promise<void> {
+  probing.value = true;
+  try {
+    player.value = await detectPlayer();
+  } catch {
+    player.value = null;
+  } finally {
+    probing.value = false;
+  }
+}
+
+/** 先保存设置再扫描，避免用了旧目录。 */
+async function onScan(): Promise<void> {
+  status.value = "";
+  await onSave();
+  await media.scan();
+  status.value = media.toast;
+}
+
+async function onClear(): Promise<void> {
+  status.value = "";
+  await media.clearAll();
+  status.value = media.toast;
+}
 </script>
 
 <template>
@@ -50,12 +87,12 @@ async function onReload(): Promise<void> {
     <h2>设置</h2>
 
     <div class="field">
-      <label>TMDB API Key</label>
+      <label>TMDB API Key（模块④ 刮削需要）</label>
       <input v-model="store.tmdbKey" type="password" placeholder="粘贴 TMDB v3 API Key" />
     </div>
 
     <div class="field">
-      <label>媒体目录</label>
+      <label>媒体目录（递归扫描视频文件）</label>
       <div class="dirs">
         <div v-for="(d, i) in store.mediaDirs" :key="d + i" class="dir">
           <span class="path">{{ d }}</span>
@@ -66,7 +103,7 @@ async function onReload(): Promise<void> {
       <div class="add">
         <input
           v-model="newDir"
-          placeholder="例如 D:\Movies（模块⑧ 将支持目录选择器）"
+          placeholder="例如 D:\Movies 或 E:\电视剧"
           @keyup.enter="addDir"
         />
         <button class="mini" @click="addDir">添加</button>
@@ -74,8 +111,12 @@ async function onReload(): Promise<void> {
     </div>
 
     <div class="field">
-      <label>PotPlayer 路径</label>
+      <label>PotPlayer 路径（留空自动探测常见安装位置）</label>
       <input v-model="store.potPlayerPath" placeholder="例如 D:\PotPlayer\PotPlayerMini64.exe" />
+      <p class="hint">
+        {{ probing ? "探测中…" : player ? `当前探测到：${player}` : "未检测到 PotPlayer，将回退到系统默认播放器" }}
+        <button class="mini inline" @click="probePlayer">重新探测</button>
+      </p>
     </div>
 
     <div class="actions">
@@ -83,18 +124,47 @@ async function onReload(): Promise<void> {
         {{ store.saving ? "保存中…" : "保存" }}
       </button>
       <button class="mini" @click="onReload">重新加载</button>
-      <span v-if="status" class="status">{{ status }}</span>
+      <button class="mini" :disabled="media.scanning" @click="onScan">
+        {{ media.scanning ? "扫描中…" : "保存并扫描媒体库" }}
+      </button>
     </div>
 
-    <p v-if="tables.length" class="db">数据表：{{ tables.join(" · ") }}</p>
+    <p v-if="status" class="status">{{ status }}</p>
+
+    <div class="field">
+      <label>最近扫描记录</label>
+      <table v-if="media.scanHistory.length" class="hist">
+        <thead>
+          <tr><th>时间</th><th>范围</th><th>发现</th><th>新增</th><th>状态</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="h in media.scanHistory" :key="h.id">
+            <td>{{ fmtTime(h.finished_at ?? h.started_at) }}</td>
+            <td>{{ h.path }}</td>
+            <td>{{ h.found }}</td>
+            <td>{{ h.added }}</td>
+            <td>{{ h.status }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="empty">暂无扫描记录</p>
+    </div>
+
+    <div class="field">
+      <label>维护</label>
+      <div class="actions">
+        <button class="mini danger" @click="onClear">清空媒体库（保留设置）</button>
+      </div>
+      <p v-if="tables.length" class="hint">数据表：{{ tables.join(" · ") }}</p>
+    </div>
   </section>
 </template>
 
 <style scoped>
-.settings { max-width: 640px; }
-h2 { margin: 0 0 calc(var(--space) * 6); font-size: 20px; }
-.field { margin-bottom: calc(var(--space) * 6); }
-label { display: block; margin-bottom: calc(var(--space) * 2); color: var(--muted); font-size: 13px; }
+.settings { max-width: 720px; display: flex; flex-direction: column; gap: calc(var(--space) * 6); }
+h2 { margin: 0; font-size: 20px; }
+.field { display: flex; flex-direction: column; gap: calc(var(--space) * 2); }
+label { color: var(--muted); font-size: 13px; }
 input {
   width: 100%; padding: 8px 10px; border-radius: 6px; font-size: 14px;
   border: 1px solid rgba(255,255,255,.14); background: var(--surface); color: var(--text);
@@ -106,12 +176,21 @@ input {
 }
 .path { font-size: 13px; word-break: break-all; }
 .empty { margin: 0; color: var(--muted); font-size: 13px; }
-.add { display: flex; gap: 8px; margin-top: calc(var(--space) * 2); }
-.actions { display: flex; align-items: center; gap: 10px; }
+.hint { margin: 0; color: var(--muted); font-size: 12px; word-break: break-all; }
+.add { display: flex; gap: 8px; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 button { cursor: pointer; border: 0; border-radius: 6px; font-size: 13px; }
 .primary { padding: 9px 18px; background: var(--accent); color: #fff; }
 .primary:disabled { opacity: .6; cursor: default; }
 .mini { padding: 6px 12px; background: rgba(255,255,255,.08); color: var(--text); }
-.status { font-size: 13px; color: var(--muted); }
-.db { margin-top: calc(var(--space) * 5); color: var(--muted); font-size: 12px; }
+.mini.inline { margin-left: 8px; padding: 3px 8px; font-size: 12px; }
+.mini.danger { background: rgba(229,9,20,.16); color: #ff6b73; }
+.mini:disabled { opacity: .6; cursor: default; }
+.status { margin: 0; font-size: 13px; color: var(--muted); }
+
+.hist { width: 100%; border-collapse: collapse; font-size: 12px; }
+.hist th, .hist td {
+  padding: 6px 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,.07);
+}
+.hist th { color: var(--muted); font-weight: 500; }
 </style>

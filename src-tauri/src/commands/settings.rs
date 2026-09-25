@@ -49,6 +49,23 @@ fn read_value(conn: &Connection, key: &str) -> Option<String> {
     .ok()
 }
 
+/// 读取媒体目录列表（供扫描命令复用）。
+pub fn load_media_dirs(conn: &Connection) -> Vec<String> {
+    read_value(conn, KEY_MEDIA_DIRS)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// 读取 PotPlayer 路径（供播放命令复用）。
+pub fn load_potplayer_path(conn: &Connection) -> String {
+    read_value(conn, KEY_POTPLAYER).unwrap_or_default()
+}
+
+/// 读取 TMDB API Key（供刮削命令复用）。
+pub fn load_tmdb_key(conn: &Connection) -> String {
+    read_value(conn, KEY_TMDB_KEY).unwrap_or_default()
+}
+
 fn write_value(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) \

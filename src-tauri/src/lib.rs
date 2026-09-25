@@ -1,5 +1,8 @@
 mod commands;
 mod db;
+mod parser;
+mod scanner;
+mod tmdb;
 
 use serde::Serialize;
 use std::sync::Mutex;
@@ -28,9 +31,28 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ping,
+            // 设置
             commands::settings::get_settings,
             commands::settings::set_settings,
             commands::settings::db_info,
+            // 媒体库
+            commands::media::scan_library,
+            commands::media::get_media_list,
+            commands::media::get_media_detail,
+            commands::media::get_episodes,
+            commands::media::delete_media,
+            commands::media::clear_library,
+            commands::media::get_scan_history,
+            // 刮削
+            commands::scrape::search_tmdb,
+            commands::scrape::scrape_media,
+            commands::scrape::scrape_all,
+            commands::scrape::apply_tmdb_match,
+            commands::scrape::has_metadata,
+            // 播放
+            commands::play::detect_player,
+            commands::play::play_media,
+            commands::play::reveal_in_explorer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
