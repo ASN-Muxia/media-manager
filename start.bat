@@ -117,6 +117,11 @@ echo [错误] Rust 编译失败。常见原因：
 echo        - 提示 "linker `link.exe` not found"：缺少 MSVC 生成工具。
 echo          安装 Visual Studio Build Tools 并勾选「使用 C++ 的桌面开发」。
 echo        - 提示网络/代理错误：可设置 CARGO_HTTP_CHECK_REVOKE=false 后重试。
+echo        - 提示 "the compiler unexpectedly panicked"（ICE 编译器内部崩溃）：
+echo          多半是增量编译缓存损坏。依次执行以下两条命令后重试：
+echo            cd src-tauri ^&^& cargo clean
+echo            cargo build --features custom-protocol
+echo          （本项目已在 Cargo.toml 里关闭增量编译，原则上不会再发生）
 goto :fail
 
 :err_noexe

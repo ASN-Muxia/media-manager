@@ -22,6 +22,18 @@ tauri-build = { version = "2", features = [] }
 # 需要热重载开发时改用 `npm run tauri dev`（走 devUrl，不带该 feature）。
 custom-protocol = ["tauri/custom-protocol"]
 
+[profile.dev]
+# 关闭增量编译。
+#
+# 原因：本机增量缓存多次损坏（日志里反复出现
+# `error copying object file ... metadata.rmeta / error deleting lock file ... os error 5`），
+# 并在反复切换 feature（custom-protocol）后导致 rustc 在 rmeta 编码阶段直接 ICE：
+# `rustc_metadata/src/rmeta/encoder.rs: no entry found for key`。
+# 这类缓存损坏会让 rustc 读取到陈旧的 query 结果而崩溃。
+# 本项目体量不大，关闭增量后完整编译依然很快（秒级），还能显著减小 target/ 体积。
+# 修复/恢复手段始终是：`cargo clean` 后重新构建。
+incremental = false
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }

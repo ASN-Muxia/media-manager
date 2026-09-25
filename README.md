@@ -121,6 +121,20 @@ cargo build --features custom-protocol
 
 缺少 MSVC 生成工具。安装 Visual Studio Build Tools，勾选「使用 C++ 的桌面开发」。
 
+### 编译报 `the compiler unexpectedly panicked`（ICE 编译器内部崩溃）
+
+**这不是代码 bug**，是增量编译缓存损坏（本机 exe 运行中被锁/杀软干扰导致增量文件半写入，
+叠加反复切换 feature 所致）。恢复方法：
+
+```bash
+cd src-tauri
+cargo clean
+cargo build --features custom-protocol
+```
+
+本项目已在 `Cargo.toml` 里用 `[profile.dev] incremental = false` 永久关闭增量编译，
+原则上不会再发生；完整编译仍是秒级。
+
 ### `cargo` / `npm` 提示「不是内部或外部命令」
 
 本机 cmd 的 PATH 查找可能失效，请用完整路径调用，或直接用 `start.bat` / `verify.bat`（脚本内置全路径）。
