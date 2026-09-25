@@ -100,7 +100,11 @@ export const useMediaStore = defineStore("media", () => {
     error.value = null;
     try {
       const r = await scrapeMedia(id, tmdbId);
-      note(r.ok ? `刮削成功：${r.title ?? ""}` : r.message);
+      note(
+        r.ok
+          ? `刮削成功：${r.title ?? ""}${r.episodes > 0 ? `（同步 ${r.episodes} 集）` : ""}`
+          : r.message,
+      );
       await openDetail(id);
       await load();
     } catch (e) {

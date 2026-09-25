@@ -39,6 +39,11 @@ pub struct Episode {
     pub file_name: Option<String>,
     pub file_size: Option<i64>,
     pub added_at: i64,
+    /// 以下字段由单集级刮削回填，未刮削时为 null。
+    pub tmdb_id: Option<i64>,
+    pub overview: Option<String>,
+    pub still_path: Option<String>,
+    pub air_date: Option<String>,
 }
 
 /// 详情（主记录 + 单集列表）。
@@ -95,6 +100,10 @@ fn map_episode(row: &Row<'_>) -> rusqlite::Result<Episode> {
         file_name: row.get(6)?,
         file_size: row.get(7)?,
         added_at: row.get(8)?,
+        tmdb_id: row.get(9)?,
+        overview: row.get(10)?,
+        still_path: row.get(11)?,
+        air_date: row.get(12)?,
     })
 }
 
@@ -156,7 +165,8 @@ pub fn get_media_detail(
 fn query_episodes(conn: &Connection, media_id: i64) -> Result<Vec<Episode>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, media_id, season, episode, title, file_path, file_name, file_size, added_at \
+            "SELECT id, media_id, season, episode, title, file_path, file_name, file_size, added_at, \
+                    tmdb_id, overview, still_path, air_date \
              FROM episodes WHERE media_id = ?1 ORDER BY season ASC, episode ASC",
         )
         .map_err(|e| e.to_string())?;

@@ -1,11 +1,19 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import {
-  imageUrl, searchTmdb, tmdbTitle, tmdbYear, type TmdbSearchItem,
+  imageUrl, searchTmdb, tmdbTitle, tmdbYear, type Episode, type TmdbSearchItem,
 } from "../api/commands";
 import { useMediaStore } from "../stores/mediaStore";
 
 const store = useMediaStore();
+
+/** 刮削过的用 TMDB 集名，未刮削的退回文件名（更可读）。 */
+function epTitle(e: Episode): string {
+  const scraped = Boolean(e.still_path || e.overview);
+  return scraped
+    ? e.title || e.file_name || "(未命名)"
+    : e.file_name || e.title || "(未命名)";
+}
 
 const detail = computed(() => store.detail);
 const poster = computed(() => imageUrl(detail.value?.media.poster_path, "w342"));
@@ -152,8 +160,17 @@ function pick(it: TmdbSearchItem): void {
         <h3>第 {{ s.season }} 季</h3>
         <ul>
           <li v-for="e in s.list" :key="e.id">
+            <img
+              v-if="imageUrl(e.still_path, 'w92')"
+              class="ep-thumb"
+              :src="imageUrl(e.still_path, 'w92')!"
+              alt=""
+            />
             <span class="ep-no">E{{ String(e.episode).padStart(2, "0") }}</span>
-            <span class="ep-title" :title="e.file_name ?? ''">{{ e.file_name || e.title }}</span>
+            <span class="ep-main">
+              <span class="ep-title" :title="e.file_name ?? ''">{{ epTitle(e) }}</span>
+              <span v-if="e.air_date" class="ep-date">{{ e.air_date }}</span>
+            </span>
             <button class="btn small" @click="store.play(e.file_path)">▶ 播放</button>
             <button class="btn small ghost" @click="store.reveal(e.file_path)">目录</button>
           </li>
@@ -236,6 +253,9 @@ h3 { margin: 0 0 8px; font-size: 15px; color: var(--muted); font-weight: 600; }
   display: flex; align-items: center; gap: 12px; padding: 7px 10px;
   border-radius: 6px; background: var(--surface);
 }
-.ep-no { flex: none; width: 38px; font-size: 12px; color: var(--muted); }
-.ep-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ep-no { flex: none; width: 34px; font-size: 12px; color: var(--muted); }
+.ep-thumb { width: 56px; border-radius: 4px; flex: none; display: block; }
+.ep-main { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ep-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ep-date { font-size: 11px; color: var(--muted); }
 </style>

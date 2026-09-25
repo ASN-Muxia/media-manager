@@ -22,6 +22,7 @@ fn ping() -> Ping {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 打开（必要时创建）SQLite 数据库并注入全局连接。
             let conn = db::open(app.handle())

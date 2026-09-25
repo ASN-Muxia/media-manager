@@ -137,6 +137,29 @@ struct SearchResponse {
     results: Vec<TmdbSearchItem>,
 }
 
+/// 某一季里的单集条目。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TmdbEpisodeItem {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub episode_number: i64,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub still_path: Option<String>,
+    #[serde(default)]
+    pub air_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeasonResponse {
+    #[serde(default)]
+    episodes: Vec<TmdbEpisodeItem>,
+}
+
 /// TMDB 客户端。
 pub struct TmdbClient {
     agent: ureq::Agent,
@@ -212,6 +235,13 @@ impl TmdbClient {
         };
         let raw: Value = self.get_json(&path, &[("language", "zh-CN".to_string())])?;
         Ok(TmdbMeta::from_value(id, kind, &raw))
+    }
+
+    /// 取某一季的单集列表（单集级刮削用）。
+    pub fn season_episodes(&self, tv_id: i64, season: i64) -> Result<Vec<TmdbEpisodeItem>, String> {
+        let path = format!("/tv/{tv_id}/season/{season}");
+        let resp: SeasonResponse = self.get_json(&path, &[("language", "zh-CN".to_string())])?;
+        Ok(resp.episodes)
     }
 }
 
@@ -315,5 +345,28 @@ mod tests {
         .unwrap();
         assert_eq!(resp.results.len(), 2);
         assert_eq!(resp.results[0].id, 1);
+    }
+
+    #[test]
+    fn season_response_parses_episodes() {
+        let resp: SeasonResponse = serde_json::from_str(
+            r#"{"season_number":1,"episodes":[
+                 {"id":11,"episode_number":1,"name":"试播集","overview":"简介",
+                  "still_path":"/s1.jpg","air_date":"2008-01-20"},
+                 {"id":12,"episode_number":2}
+               ]}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.episodes.len(), 2);
+        assert_eq!(resp.episodes[0].episode_number, 1);
+        assert_eq!(resp.episodes[0].name.as_deref(), Some("试播集"));
+        assert_eq!(resp.episodes[0].still_path.as_deref(), Some("/s1.jpg"));
+        assert_eq!(resp.episodes[1].name, None, "缺字段应容错为 None");
+    }
+
+    #[test]
+    fn season_response_tolerates_missing_episodes_key() {
+        let resp: SeasonResponse = serde_json::from_str(r#"{"season_number":1}"#).unwrap();
+        assert!(resp.episodes.is_empty());
     }
 }

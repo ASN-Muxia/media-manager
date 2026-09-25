@@ -18,6 +18,8 @@ pub struct ScrapeOutcome {
     pub media_id: i64,
     pub tmdb_id: Option<i64>,
     pub title: Option<String>,
+    /// 本次同步到的单集条数（电影恒为 0）。
+    pub episodes: i64,
     pub message: String,
 }
 
@@ -76,6 +78,58 @@ fn update_meta(conn: &Connection, id: i64, tmdb_id: i64, meta: &crate::tmdb::Tmd
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 单集级刮削：按库中已存在的季号逐季拉取单集元数据并回填。
+///
+/// 某一季请求失败**不中断**其余季（网络抖动时尽量多回填一些）。
+fn fill_episodes(
+    conn: &Connection,
+    client: &TmdbClient,
+    media_id: i64,
+    tv_id: i64,
+) -> Result<i64, String> {
+    let seasons: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT season FROM episodes WHERE media_id = ?1 ORDER BY season")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![media_id], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let mut updated = 0i64;
+    for season in seasons {
+        let Ok(list) = client.season_episodes(tv_id, season) else {
+            continue;
+        };
+        for ep in list {
+            let n = conn
+                .execute(
+                    "UPDATE episodes SET \
+                        tmdb_id    = COALESCE(?3, tmdb_id), \
+                        title      = COALESCE(NULLIF(?4, ''), title), \
+                        overview   = COALESCE(?5, overview), \
+                        still_path = COALESCE(?6, still_path), \
+                        air_date   = COALESCE(?7, air_date) \
+                     WHERE media_id = ?1 AND season = ?2 AND episode = ?8",
+                    params![
+                        media_id,
+                        season,
+                        if ep.id > 0 { Some(ep.id) } else { None },
+                        ep.name.clone().unwrap_or_default(),
+                        ep.overview,
+                        ep.still_path,
+                        ep.air_date,
+                        ep.episode_number
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            updated += n as i64;
+        }
+    }
+    Ok(updated)
 }
 
 /// 搜索 TMDB 候选（供详情页手动匹配）。
@@ -145,15 +199,21 @@ pub fn scrape_media(
             media_id: id,
             tmdb_id: None,
             title: None,
+            episodes: 0,
             message: "未在 TMDB 找到匹配条目".to_string(),
         });
     };
 
     // 2) 取详情并回填
     let meta = client.detail(&pending.media_type, tmdb_id)?;
+    let mut episodes = 0i64;
     {
         let conn = state.lock().map_err(|e| e.to_string())?;
         update_meta(&conn, id, tmdb_id, &meta)?;
+        // 3) 剧集则继续做单集级回填
+        if pending.media_type == "tv" {
+            episodes = fill_episodes(&conn, &client, id, tmdb_id).unwrap_or(0);
+        }
     }
 
     Ok(ScrapeOutcome {
@@ -161,7 +221,12 @@ pub fn scrape_media(
         media_id: id,
         tmdb_id: Some(tmdb_id),
         title: Some(meta.title.clone()),
-        message: "刮削成功".to_string(),
+        episodes,
+        message: if episodes > 0 {
+            format!("刮削成功，同步了 {episodes} 集")
+        } else {
+            "刮削成功".to_string()
+        },
     })
 }
 
@@ -231,7 +296,12 @@ pub fn scrape_all(
             Some(tmdb_id) => match client.detail(&pending.media_type, tmdb_id) {
                 Ok(meta) => {
                     let conn = state.lock().map_err(|e| e.to_string())?;
-                    if update_meta(&conn, id, tmdb_id, &meta).is_ok() {
+                    let ok = update_meta(&conn, id, tmdb_id, &meta).is_ok();
+                    if ok {
+                        // 剧集顺带做单集级回填
+                        if pending.media_type == "tv" {
+                            let _ = fill_episodes(&conn, &client, id, tmdb_id);
+                        }
                         summary.ok += 1;
                     } else {
                         summary.failed += 1;

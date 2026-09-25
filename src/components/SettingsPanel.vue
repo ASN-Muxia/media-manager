@@ -4,6 +4,7 @@
  * 目录选择器（原生 dialog 插件）留待后续版本。
  */
 import { onMounted, ref } from "vue";
+import { open } from "@tauri-apps/plugin-dialog";
 import { dbInfo, detectPlayer } from "../api/commands";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useMediaStore } from "../stores/mediaStore";
@@ -38,6 +39,35 @@ function addDir(): void {
   if (!d) return;
   store.addDir(d);
   newDir.value = "";
+}
+
+/** 原生目录选择器。 */
+async function browseDir(): Promise<void> {
+  status.value = "";
+  try {
+    const picked = await open({ directory: true, multiple: false, title: "选择媒体目录" });
+    if (typeof picked === "string" && picked) store.addDir(picked);
+  } catch (e) {
+    status.value = "❌ 打开目录选择器失败：" + String(e);
+  }
+}
+
+/** 原生文件选择器：挑 PotPlayer 可执行文件。 */
+async function browsePlayer(): Promise<void> {
+  status.value = "";
+  try {
+    const picked = await open({
+      multiple: false,
+      title: "选择 PotPlayer 可执行文件",
+      filters: [{ name: "可执行文件", extensions: ["exe"] }],
+    });
+    if (typeof picked === "string" && picked) {
+      store.potPlayerPath = picked;
+      await probePlayer();
+    }
+  } catch (e) {
+    status.value = "❌ 打开文件选择器失败：" + String(e);
+  }
 }
 
 async function onSave(): Promise<void> {
@@ -107,12 +137,16 @@ async function onClear(): Promise<void> {
           @keyup.enter="addDir"
         />
         <button class="mini" @click="addDir">添加</button>
+        <button class="mini" @click="browseDir">浏览…</button>
       </div>
     </div>
 
     <div class="field">
       <label>PotPlayer 路径（留空自动探测常见安装位置）</label>
-      <input v-model="store.potPlayerPath" placeholder="例如 D:\PotPlayer\PotPlayerMini64.exe" />
+      <div class="add">
+        <input v-model="store.potPlayerPath" placeholder="例如 D:\PotPlayer\PotPlayerMini64.exe" />
+        <button class="mini" @click="browsePlayer">浏览…</button>
+      </div>
       <p class="hint">
         {{ probing ? "探测中…" : player ? `当前探测到：${player}` : "未检测到 PotPlayer，将回退到系统默认播放器" }}
         <button class="mini inline" @click="probePlayer">重新探测</button>

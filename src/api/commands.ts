@@ -28,6 +28,11 @@ export interface Episode {
   file_name: string | null;
   file_size: number | null;
   added_at: number;
+  /** 以下字段由单集级刮削回填 */
+  tmdb_id?: number | null;
+  overview?: string | null;
+  still_path?: string | null;
+  air_date?: string | null;
 }
 
 export interface MediaDetail {
@@ -87,6 +92,8 @@ export interface ScrapeOutcome {
   mediaId: number;
   tmdbId: number | null;
   title: string | null;
+  /** 本次同步到的单集条数 */
+  episodes: number;
   message: string;
 }
 
@@ -97,10 +104,11 @@ export interface ScrapeSummary {
   noKey: boolean;
 }
 
-export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<T>(cmd, args);
-}
+// 直接复用 Tauri 的 invoke（插件已静态依赖 @tauri-apps/api，
+// 这里再包一层动态 import 只会让打包告警且无收益）。
+import { invoke } from "@tauri-apps/api/core";
+
+export { invoke };
 
 /** 拼 TMDB 图片地址。 */
 export function imageUrl(path: string | null | undefined, size = "w342"): string | null {

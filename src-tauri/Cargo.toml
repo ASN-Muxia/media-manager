@@ -19,3 +19,4 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 walkdir = "2.5.0"
 regex = "1.13.1"
 ureq = { version = "2", features = ["json"] }
+tauri-plugin-dialog = "2.7.3"

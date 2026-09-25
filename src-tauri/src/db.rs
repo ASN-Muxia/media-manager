@@ -53,7 +53,11 @@ CREATE TABLE IF NOT EXISTS episodes (
     file_name TEXT,
     file_size INTEGER,
     duration  INTEGER,
-    added_at  INTEGER NOT NULL
+    added_at  INTEGER NOT NULL,
+    tmdb_id    INTEGER,
+    overview   TEXT,
+    still_path TEXT,
+    air_date   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS scan_history (
@@ -100,13 +104,61 @@ pub fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join(DB_FILE))
 }
 
-/// 打开数据库并确保表结构就绪。
+/// 打开数据库并确保表结构就绪（含增量迁移）。
 pub fn open(app: &AppHandle) -> Result<Connection, String> {
     let path = db_path(app)?;
     let conn = Connection::open(&path).map_err(|e| format!("打开数据库失败: {e}"))?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+/// 当前结构版本。v1 = 初始 4 表；v2 = episodes 增加 tmdb_id/overview/still_path/air_date。
+pub const SCHEMA_VERSION: i32 = 2;
+
+/// 建表 + 增量迁移。对**已存在的老库**用 `ALTER TABLE` 补列，保证升级不丢数据。
+pub fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(SCHEMA)
         .map_err(|e| format!("初始化表结构失败: {e}"))?;
-    Ok(conn)
+
+    // v1 -> v2：为单集补充 TMDB 元数据列
+    ensure_column(conn, "episodes", "tmdb_id", "INTEGER")?;
+    ensure_column(conn, "episodes", "overview", "TEXT")?;
+    ensure_column(conn, "episodes", "still_path", "TEXT")?;
+    ensure_column(conn, "episodes", "air_date", "TEXT")?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 若列不存在则添加（幂等）。
+pub fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<(), String> {
+    if column_exists(conn, table, column)? {
+        return Ok(());
+    }
+    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])
+        .map_err(|e| format!("为 {table} 添加列 {column} 失败: {e}"))?;
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?;
+    for n in names {
+        if n.map_err(|e| e.to_string())? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 列出用户表名（健康检查用）。
@@ -148,5 +200,61 @@ mod tests {
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         assert_eq!(tables(&conn).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn fresh_schema_has_episode_metadata_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for col in ["tmdb_id", "overview", "still_path", "air_date"] {
+            assert!(column_exists(&conn, "episodes", col).unwrap(), "缺少列 {col}");
+        }
+        let v: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// 关键：老库升级不能丢数据，也不能因为列已存在而报错。
+    #[test]
+    fn migrate_upgrades_legacy_episodes_table_without_data_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE episodes (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 media_id INTEGER NOT NULL,
+                 season INTEGER NOT NULL DEFAULT 1,
+                 episode INTEGER NOT NULL DEFAULT 1,
+                 title TEXT, file_path TEXT, file_name TEXT,
+                 file_size INTEGER, duration INTEGER, added_at INTEGER NOT NULL);
+             INSERT INTO episodes (media_id, season, episode, title, added_at)
+             VALUES (1, 1, 1, '老数据', 0);",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "episodes", "still_path").unwrap());
+
+        migrate(&conn).unwrap();
+
+        for col in ["tmdb_id", "overview", "still_path", "air_date"] {
+            assert!(column_exists(&conn, "episodes", col).unwrap(), "缺少列 {col}");
+        }
+        let title: String = conn
+            .query_row("SELECT title FROM episodes WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "老数据", "迁移不应丢失原有数据");
+    }
+
+    #[test]
+    fn ensure_column_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER);").unwrap();
+        ensure_column(&conn, "t", "b", "TEXT").unwrap();
+        ensure_column(&conn, "t", "b", "TEXT").unwrap();
+        ensure_column(&conn, "t", "b", "INTEGER").unwrap(); // 已存在时忽略新声明
+        assert!(column_exists(&conn, "t", "b").unwrap());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('t')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "不应重复加列");
     }
 }
