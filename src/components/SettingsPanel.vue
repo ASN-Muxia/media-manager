@@ -5,7 +5,7 @@
  */
 import { onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { dbInfo, detectPlayer, openDataDir } from "../api/commands";
+import { dbInfo, detectPlayer, openDataDir, readReadyMarker, runtimeInfo } from "../api/commands";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useMediaStore } from "../stores/mediaStore";
 
@@ -17,6 +17,9 @@ const status = ref("");
 const tables = ref<string[]>([]);
 const player = ref<string | null>(null);
 const probing = ref(false);
+const schemaVersion = ref<number | null>(null);
+const dbPath = ref("");
+const pageUrl = ref("");
 
 function fmtTime(ts: number | null): string {
   if (!ts) return "-";
@@ -30,6 +33,21 @@ onMounted(async () => {
     tables.value = (await dbInfo()).tables;
   } catch {
     tables.value = [];
+  }
+  try {
+    const rt = await runtimeInfo();
+    schemaVersion.value = rt.schemaVersion;
+    dbPath.value = rt.dbPath;
+    tables.value = rt.tables;
+  } catch {
+    /* 忽略：诊断信息拿不到不影响使用 */
+  }
+  try {
+    const marker = await readReadyMarker();
+    const line = (marker ?? "").split("\n").find((l) => l.startsWith("url="));
+    pageUrl.value = line ? line.slice(4) : "";
+  } catch {
+    /* 同上 */
   }
   void probePlayer();
 });
@@ -201,6 +219,15 @@ async function onOpenDataDir(): Promise<void> {
         <button class="mini danger" @click="onClear">清空媒体库（保留设置）</button>
       </div>
       <p v-if="tables.length" class="hint">数据表：{{ tables.join(" · ") }}</p>
+      <p v-if="pageUrl" class="hint">
+        页面来源：{{ pageUrl }}
+        <span v-if="pageUrl.includes('localhost:')" class="warn">
+          （dev 模式：需先启动 vite dev server；正常使用请用 start.bat 构建）
+        </span>
+      </p>
+      <p v-if="dbPath" class="hint">
+        数据库：{{ dbPath }}<span v-if="schemaVersion !== null">（结构版本 v{{ schemaVersion }}）</span>
+      </p>
     </div>
   </section>
 </template>
@@ -222,6 +249,7 @@ input {
 .path { font-size: 13px; word-break: break-all; }
 .empty { margin: 0; color: var(--muted); font-size: 13px; }
 .hint { margin: 0; color: var(--muted); font-size: 12px; word-break: break-all; }
+.warn { color: #ffb454; }
 .add { display: flex; gap: 8px; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 button { cursor: pointer; border: 0; border-radius: 6px; font-size: 13px; }

@@ -55,6 +55,10 @@ pub fn run() {
             commands::play::detect_player,
             commands::play::play_media,
             commands::play::reveal_in_explorer,
+            // 启动自检与诊断
+            commands::diag::frontend_ready,
+            commands::diag::read_ready_marker,
+            commands::diag::runtime_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

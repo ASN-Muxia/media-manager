@@ -82,7 +82,10 @@ npm run typecheck
 # Rust 测试 / 编译
 cd src-tauri
 cargo test
-cargo build
+# 生成「可直接运行」的 app：前端资源会被内嵌进二进制
+cargo build --features custom-protocol
+# 只做类型/借用检查（不需要内嵌资源）
+cargo check
 
 # 一体化开发（注意：beforeDevCommand 走 npm run dev，
 # 若本机 cmd 的 PATH 查找失效，直接 cargo run 更稳）
@@ -97,7 +100,32 @@ cd src-tauri && cargo run
 4. 点海报进详情页：可播放、重新刮削、手动匹配 TMDB、在文件夹中显示；
 5. 剧集详情页按季列出单集（刮削后会显示缩略图、集名与播出日期）。
 
-## 五、数据位置
+## 五、常见问题
+
+### 窗口显示「无法访问此页面 / localhost 拒绝连接 / ERR_CONNECTION_REFUSED」
+
+这是因为 exe 被编译成了 **dev 模式**：tauri 的 `build.rs` 里判定是
+`dev = !has_feature("custom-protocol")`，没开这个 feature 时 webview 会去连
+`tauri.conf.json` 里的 `devUrl`（`http://localhost:1420`），而 dev server 并没有启动。
+
+**解决**：用带 `custom-protocol` 的方式构建 ——
+
+```bash
+cargo build --features custom-protocol
+```
+
+或者直接用 `start.bat`（它已经带上了这个参数）。
+需要热重载开发时才走 `npm run tauri dev`（此时由 vite dev server 提供页面）。
+
+### 编译报 `linker link.exe not found`
+
+缺少 MSVC 生成工具。安装 Visual Studio Build Tools，勾选「使用 C++ 的桌面开发」。
+
+### `cargo` / `npm` 提示「不是内部或外部命令」
+
+本机 cmd 的 PATH 查找可能失效，请用完整路径调用，或直接用 `start.bat` / `verify.bat`（脚本内置全路径）。
+
+## 六、数据位置
 
 | 内容 | 路径 |
 |---|---|
@@ -107,7 +135,7 @@ cd src-tauri && cargo run
 设置页有「打开数据目录」按钮可直接定位。数据库结构版本记录在 `PRAGMA user_version`，
 升级时通过 `db::migrate` 自动增量补列，**不会丢失已有数据**。
 
-## 六、项目结构
+## 七、项目结构
 
 ```
 src/                      前端（Vue 3 + Pinia）
@@ -124,7 +152,7 @@ start.bat / verify.bat    快速启动与一键盘点
 交接状态-2026-09-25.md     详细的开发与验证记录
 ```
 
-## 七、已知限制
+## 八、已知限制
 
 - 前端只有构建 + 类型检查两道验证，没有组件级单元测试；
 - 剧集分组键取「媒体根目录下的第一层目录名」，若目录结构异常会退回解析标题；

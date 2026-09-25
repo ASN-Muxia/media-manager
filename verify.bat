@@ -93,11 +93,11 @@ popd
 exit /b %MM_RC%
 
 :rust_test
-call "%MM_CARGO%" test --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml" --quiet
+call "%MM_CARGO%" test --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml" --quiet
 exit /b %ERRORLEVEL%
 
 :rust_build
-call "%MM_CARGO%" build --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
+call "%MM_CARGO%" build --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
 exit /b %ERRORLEVEL%
 
 rem ------------------------------------------------------------------ ³ö´í´¦Àí

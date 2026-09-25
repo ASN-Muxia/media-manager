@@ -90,8 +90,8 @@ if not "%MM_RC%"=="0" goto :err_frontend
 
 echo.
 echo [2/3] 编译 Rust（首次编译需要几分钟，请耐心等待）...
-if "%MM_PROFILE%"=="release" call "%MM_CARGO%" build --release --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
-if "%MM_PROFILE%"=="debug" call "%MM_CARGO%" build --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
+if "%MM_PROFILE%"=="release" call "%MM_CARGO%" build --release --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
+if "%MM_PROFILE%"=="debug" call "%MM_CARGO%" build --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
 if errorlevel 1 goto :err_rust
 exit /b 0
 

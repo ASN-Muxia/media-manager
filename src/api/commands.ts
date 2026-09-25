@@ -148,6 +148,24 @@ export function openDataDir(): Promise<string> {
   return invoke<string>("open_data_dir");
 }
 
+/** 运行时诊断信息（数据库位置、结构版本等）。 */
+export interface RuntimeInfo {
+  dbPath: string;
+  schemaVersion: number;
+  tables: string[];
+  os: string;
+  arch: string;
+}
+
+export function runtimeInfo(): Promise<RuntimeInfo> {
+  return invoke<RuntimeInfo>("runtime_info");
+}
+
+/** 前端启动自检标记（内容含页面 URL，可判断是 dev 模式还是内嵌资源模式）。 */
+export function readReadyMarker(): Promise<string | null> {
+  return invoke<string | null>("read_ready_marker");
+}
+
 /* ---------------------- 模块③ 扫描与列表 ---------------------- */
 
 export function scanLibrary(roots?: string[]): Promise<ScanStats> {
