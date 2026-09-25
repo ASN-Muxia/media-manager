@@ -187,7 +187,8 @@ export const useMediaStore = defineStore("media", () => {
     const kw = keyword.value.trim().toLowerCase();
     if (!kw) return items.value;
     return items.value.filter((it) => {
-      const hay = `${it.title} ${it.genre ?? ""} ${it.year ?? ""}`.toLowerCase();
+      const hay =
+        `${it.display_title} ${it.title} ${it.genre ?? ""} ${it.year ?? ""}`.toLowerCase();
       return hay.includes(kw);
     });
   }

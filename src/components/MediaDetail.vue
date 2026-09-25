@@ -89,7 +89,7 @@ function pick(it: TmdbSearchItem): void {
         <img v-if="poster" class="poster" :src="poster" :alt="detail.media.title" />
         <div v-else class="poster ph">{{ detail.media.type === "tv" ? "📺" : "🎬" }}</div>
         <div class="info">
-          <h2>{{ detail.media.title }}</h2>
+          <h2>{{ detail.media.display_title }}</h2>
           <p class="line">
             <span class="tag">{{ detail.media.type === "tv" ? "剧集" : "电影" }}</span>
             <span v-if="detail.media.year">{{ detail.media.year }}</span>

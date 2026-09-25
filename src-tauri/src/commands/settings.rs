@@ -112,6 +112,18 @@ pub fn db_info(state: State<'_, Mutex<Connection>>) -> Result<DbInfo, String> {
     })
 }
 
+/// 在资源管理器中打开应用数据目录（数据库所在位置，便于排查问题）。
+#[tauri::command]
+pub fn open_data_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = db::data_dir(&app)?;
+    let path = dir.to_string_lossy().to_string();
+    std::process::Command::new("explorer")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("打开数据目录失败: {e}"))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

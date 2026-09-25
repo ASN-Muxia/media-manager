@@ -36,6 +36,7 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::set_settings,
             commands::settings::db_info,
+            commands::settings::open_data_dir,
             // 媒体库
             commands::media::scan_library,
             commands::media::get_media_list,

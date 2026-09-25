@@ -25,6 +25,8 @@ pub struct MediaListItem {
     pub file_name: Option<String>,
     pub episode_count: i64,
     pub added_at: i64,
+    /// 展示用标题：同名剧集会自动带上目录名以示区分（`剧名 · 目录名`）。
+    pub display_title: String,
 }
 
 /// 单集。
@@ -68,7 +70,11 @@ pub struct ScanHistoryItem {
 
 const ITEM_COLUMNS: &str = "m.id, m.type, m.title, m.year, m.tmdb_id, m.poster_path, m.backdrop_path, \
      m.overview, m.vote_average, m.genre, m.file_path, m.file_name, m.added_at, \
-     (SELECT COUNT(*) FROM episodes e WHERE e.media_id = m.id) AS episode_count";
+     (SELECT COUNT(*) FROM episodes e WHERE e.media_id = m.id) AS episode_count, \
+     CASE WHEN m.group_key IS NOT NULL \
+            AND (SELECT COUNT(*) FROM media d WHERE d.type = 'tv' AND d.type = m.type \
+                 AND d.title = m.title) > 1 \
+          THEN m.title || ' · ' || m.group_key ELSE m.title END AS display_title";
 
 fn map_item(row: &Row<'_>) -> rusqlite::Result<MediaListItem> {
     Ok(MediaListItem {
@@ -86,6 +92,7 @@ fn map_item(row: &Row<'_>) -> rusqlite::Result<MediaListItem> {
         file_name: row.get(11)?,
         added_at: row.get(12)?,
         episode_count: row.get(13)?,
+        display_title: row.get(14)?,
     })
 }
 
@@ -351,5 +358,33 @@ mod tests {
         assert!(json.get("type").is_some());
         assert_eq!(json["type"], "movie");
         assert!(json.get("media_type").is_none());
+    }
+
+    /// 同名剧集要给用户看得见的区分，否则封面墙上是两个一模一样的名字。
+    #[test]
+    fn display_title_disambiguates_same_titled_series() {
+        let conn = memory_db();
+        for key in ["Show A", "Show B"] {
+            conn.execute(
+                "INSERT INTO media (type,title,original_title,group_key,added_at,updated_at) \
+                 VALUES ('tv','Show','Show',?1,1,1)",
+                params![key],
+            )
+            .unwrap();
+        }
+        let items = query_items(&conn, "tv");
+        let titles: Vec<String> = items.iter().map(|i| i.display_title.clone()).collect();
+        assert!(titles.contains(&"Show · Show A".to_string()), "{titles:?}");
+        assert!(titles.contains(&"Show · Show B".to_string()), "{titles:?}");
+    }
+
+    #[test]
+    fn display_title_equals_title_when_unique() {
+        let conn = memory_db();
+        seed(&conn);
+        let tv = query_items(&conn, "tv");
+        assert_eq!(tv[0].display_title, tv[0].title);
+        let movie = query_items(&conn, "movie");
+        assert_eq!(movie[0].display_title, movie[0].title);
     }
 }

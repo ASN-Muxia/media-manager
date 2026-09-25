@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS media (
     type           TEXT    NOT NULL DEFAULT 'movie',
     title          TEXT    NOT NULL,
     original_title TEXT,
+    group_key      TEXT,
     year           INTEGER,
     tmdb_id        INTEGER,
     poster_path    TEXT,
@@ -112,8 +113,10 @@ pub fn open(app: &AppHandle) -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// 当前结构版本。v1 = 初始 4 表；v2 = episodes 增加 tmdb_id/overview/still_path/air_date。
-pub const SCHEMA_VERSION: i32 = 2;
+/// 当前结构版本。
+/// v1 = 初始 4 表；v2 = episodes 增加 tmdb_id/overview/still_path/air_date；
+/// v3 = media 增加 group_key（剧集分组键，同名剧集按目录区分）。
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// 建表 + 增量迁移。对**已存在的老库**用 `ALTER TABLE` 补列，保证升级不丢数据。
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -125,6 +128,12 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "episodes", "overview", "TEXT")?;
     ensure_column(conn, "episodes", "still_path", "TEXT")?;
     ensure_column(conn, "episodes", "air_date", "TEXT")?;
+
+    // v2 -> v3：剧集分组键（同名剧集按所在目录区分，避免被错误合并）
+    ensure_column(conn, "media", "group_key", "TEXT")?;
+    // 索引必须在补列之后建立，否则老库会因列不存在而失败
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_media_group ON media(type, group_key);")
+        .map_err(|e| format!("创建分组索引失败: {e}"))?;
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|e| e.to_string())?;
@@ -209,10 +218,45 @@ mod tests {
         for col in ["tmdb_id", "overview", "still_path", "air_date"] {
             assert!(column_exists(&conn, "episodes", col).unwrap(), "缺少列 {col}");
         }
+        assert!(column_exists(&conn, "media", "group_key").unwrap());
         let v: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// 老库（media 无 group_key）升级：补列 + 建索引都不能失败。
+    #[test]
+    fn migrate_adds_group_key_and_index_to_legacy_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE media (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL DEFAULT 'movie',
+                 title TEXT NOT NULL, original_title TEXT, year INTEGER, tmdb_id INTEGER,
+                 poster_path TEXT, backdrop_path TEXT, overview TEXT, vote_average REAL,
+                 genre TEXT, file_path TEXT, file_name TEXT, file_size INTEGER,
+                 duration INTEGER, added_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+             INSERT INTO media (type, title, added_at, updated_at) VALUES ('tv','老剧',0,0);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(column_exists(&conn, "media", "group_key").unwrap());
+        let title: String = conn
+            .query_row("SELECT title FROM media WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "老剧", "迁移不应丢失原有数据");
+        // 再跑一次不应报错（幂等）
+        migrate(&conn).unwrap();
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_media_group'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
     }
 
     /// 关键：老库升级不能丢数据，也不能因为列已存在而报错。

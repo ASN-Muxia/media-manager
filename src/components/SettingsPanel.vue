@@ -5,7 +5,7 @@
  */
 import { onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { dbInfo, detectPlayer } from "../api/commands";
+import { dbInfo, detectPlayer, openDataDir } from "../api/commands";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useMediaStore } from "../stores/mediaStore";
 
@@ -110,6 +110,16 @@ async function onClear(): Promise<void> {
   await media.clearAll();
   status.value = media.toast;
 }
+
+/** 打开数据库所在目录（排查问题用）。 */
+async function onOpenDataDir(): Promise<void> {
+  try {
+    const p = await openDataDir();
+    status.value = `📂 已打开数据目录：${p}`;
+  } catch (e) {
+    status.value = "❌ " + String(e);
+  }
+}
 </script>
 
 <template>
@@ -187,6 +197,7 @@ async function onClear(): Promise<void> {
     <div class="field">
       <label>维护</label>
       <div class="actions">
+        <button class="mini" @click="onOpenDataDir">打开数据目录</button>
         <button class="mini danger" @click="onClear">清空媒体库（保留设置）</button>
       </div>
       <p v-if="tables.length" class="hint">数据表：{{ tables.join(" · ") }}</p>

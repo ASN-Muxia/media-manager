@@ -16,6 +16,8 @@ export interface MediaItem {
   file_name: string | null;
   episode_count: number;
   added_at: number;
+  /** 展示用标题：同名剧集会带目录名后缀（`剧名 · 目录名`） */
+  display_title: string;
 }
 
 export interface Episode {
@@ -139,6 +141,11 @@ export function setSettings(settings: Settings): Promise<void> {
 
 export function dbInfo(): Promise<DbInfo> {
   return invoke<DbInfo>("db_info");
+}
+
+/** 在资源管理器中打开应用数据目录。 */
+export function openDataDir(): Promise<string> {
+  return invoke<string>("open_data_dir");
 }
 
 /* ---------------------- 模块③ 扫描与列表 ---------------------- */

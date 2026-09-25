@@ -13,19 +13,19 @@ const score = computed(() =>
 </script>
 
 <template>
-  <button class="card" :title="item.title" @click="emit('open', item.id)">
+  <button class="card" :title="item.display_title" @click="emit('open', item.id)">
     <div class="poster">
-      <img v-if="poster" :src="poster" :alt="item.title" loading="lazy" />
+      <img v-if="poster" :src="poster" :alt="item.display_title" loading="lazy" />
       <div v-else class="placeholder">
         <span class="icon">{{ isTv ? "📺" : "🎬" }}</span>
-        <span class="ph-title">{{ item.title }}</span>
+        <span class="ph-title">{{ item.display_title }}</span>
       </div>
       <span class="badge">{{ isTv ? "剧集" : "电影" }}</span>
       <span v-if="isTv && item.episode_count" class="eps">{{ item.episode_count }} 集</span>
       <span v-if="!item.poster_path" class="unscraped" title="尚未刮削">?</span>
     </div>
     <div class="meta">
-      <span class="title">{{ item.title }}</span>
+      <span class="title" :title="item.display_title">{{ item.display_title }}</span>
       <span class="sub">
         <span v-if="item.year">{{ item.year }}</span>
         <span v-if="score" class="score">★ {{ score }}</span>
