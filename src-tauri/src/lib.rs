@@ -96,6 +96,10 @@ pub fn run() {
             commands::scrape::has_metadata,
             commands::scrape::tvdb_apply,
             commands::scrape::omdb_lookup,
+            // 豆瓣（中文元数据兜底）
+            commands::scrape::search_douban,
+            commands::scrape::douban_apply,
+            commands::scrape::douban_test,
             commands::scrape::llm_presets,
             commands::scrape::llm_parse_name,
             commands::scrape::llm_parse_image,

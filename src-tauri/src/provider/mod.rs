@@ -7,6 +7,7 @@
 //! 共用的 HTTP 样板（`http`）在这里而不是放到 `core`：超时、鉴权错误文案、
 //! hosts 自定义解析全都属于「怎么跟外部世界说话」，与领域规则无关。
 
+pub mod douban;
 pub mod fanart;
 pub mod http;
 pub mod llm;

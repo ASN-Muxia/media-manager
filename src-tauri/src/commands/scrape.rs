@@ -21,22 +21,35 @@
 //! TMDb（片名/简介/评分/图，权威） ──┐
 //! TheTVDB（季 / 集结构，TMDb 缺集时兜底） ──┼─► 回填 media / episodes
 //! Fanart.tv（TMDb 缺图时补海报背景） ──┤
-//! OMDb（IMDb 评分补充，缺评分时才写） ──┘
+//! OMDb（IMDb 评分补充，缺评分时才写） ──┤
+//! 豆瓣（中文元数据兜底：TMDb 未命中时整条接管，
+//!       命中时只补它没给的中文字段） ──┘
 //!        ▲
 //!        │ 只影响「拿什么去检索」，绝不改写元数据本身
 //!   大模型脏文件名解析（可选，失败即回退正则）
 //! ```
 //!
 //! 任何 provider 没配 Key 就整体缺席，链路照常跑完；
-//! 关掉大模型，刮削行为与加这个模块之前**完全一致**。
+//! 关掉大模型与豆瓣，刮削行为与加这两个模块之前**完全一致**。
+//!
+//! ## 豆瓣与其他源的关系（容易搞混，单独说明）
+//!
+//! 豆瓣是**中文兜底**，不是并列的第四个「主源」：
+//! - TMDb **没命中**时，豆瓣可以**整条接管**（标题/年份/简介/评分/海报全写），
+//!   这样"没有 TMDb Key"或"冷门中文片"也不至于完全刮不出东西；
+//! - TMDb **命中**时，豆瓣只补它没给的中文字段（`release_date` / `original_title` /
+//!   空掉的 `vote_average`），已有的值一律不动。
+//!
+//! 两种情况下都遵守同一条铁律：**只补缺失，绝不覆盖**。
 
 use crate::commands::catalog;
 use super::control::ScrapeControl;
 use crate::commands::settings::{
-    load_fanart_key, load_hosts, load_llm_config, load_omdb_key, load_tmdb_key,
-    load_tmdb_language, load_tvdb_key,
+    load_douban_config, load_fanart_key, load_hosts, load_llm_config, load_omdb_key,
+    load_tmdb_key, load_tmdb_language, load_tvdb_key,
 };
 use crate::store::db::now_epoch;
+use crate::provider::douban::{DoubanClient, DoubanMeta};
 use crate::provider::fanart::{Art, FanartClient};
 use crate::provider::llm::LlmConfig;
 use crate::provider::omdb::OmdbClient;
@@ -151,6 +164,8 @@ pub struct Providers {
     pub fanart: Option<FanartClient>,
     /// IMDb 评分补充。
     pub omdb: Option<OmdbClient>,
+    /// 豆瓣（中文元数据兜底）。**要显式开启**，没开就是 `None`。
+    pub douban: Option<DoubanClient>,
     /// 大模型脏文件名解析（**可选增强层**，默认关闭）。
     pub llm: LlmConfig,
     /// 自定义 hosts 映射（所有客户端共用）。
@@ -163,14 +178,18 @@ impl Providers {
         let tvdb_key = load_tvdb_key(conn);
         let fanart_key = load_fanart_key(conn);
         let omdb_key = load_omdb_key(conn);
+        let (douban_enabled, douban_cookie) = load_douban_config(conn);
         let tvdb = TvdbClient::with_hosts(tvdb_key, &hosts);
         let fanart = FanartClient::with_hosts(fanart_key, &hosts);
         let omdb = OmdbClient::with_hosts(omdb_key, &hosts);
+        // 豆瓣没有 Key，靠开关控制；关了就让步骤整段跳过。
+        let douban = DoubanClient::with_hosts(douban_enabled, douban_cookie, &hosts);
         Providers {
             tmdb: TmdbClient::with_hosts_and_language(tmdb_key, &hosts, language),
             tvdb: if tvdb.enabled() { Some(tvdb) } else { None },
             fanart: if fanart.enabled() { Some(fanart) } else { None },
             omdb: if omdb.enabled() { Some(omdb) } else { None },
+            douban: if douban.enabled() { Some(douban) } else { None },
             llm: load_llm_config(conn),
             hosts,
         }
@@ -178,6 +197,11 @@ impl Providers {
 
     fn has_tvdb(&self) -> bool {
         self.tvdb.is_some()
+    }
+
+    /// 是否配了 TMDB Key。没配时豆瓣要承担**整条接管**的角色。
+    fn has_tmdb(&self, tmdb_key: &str) -> bool {
+        !tmdb_key.trim().is_empty()
     }
 }
 
@@ -344,6 +368,29 @@ fn merge_rating(current: Option<f64>, fetched: Option<f64>) -> Option<f64> {
     fetched.filter(|v| (0.0..=10.0).contains(v))
 }
 
+/// 文本补漏规则：当前**为空**（NULL / 空串 / 全空白）才用新值，否则一律保留原值。
+///
+/// 与 `merge_art` 同一套语义，抽出来给豆瓣的一堆文本字段复用。
+fn merge_text(current: Option<&str>, fetched: Option<&str>) -> Option<String> {
+    let has_current = current.map_or(false, |v| !v.trim().is_empty());
+    if has_current {
+        return None;
+    }
+    fetched
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+}
+
+/// 取第一个非空的字符串；两个都空就返回后者（调用方自己会 trim 判断）。
+fn nonempty_or(first: &str, fallback: &str) -> String {
+    if first.trim().is_empty() {
+        fallback.trim().to_string()
+    } else {
+        first.trim().to_string()
+    }
+}
+
 /// 用 Fanart.tv 补**缺失**的海报 / 背景图。
 ///
 /// 剧集要用 TheTVDB 的 id（Fanart.tv 的 tv 端点就是按 tvdb_id 组织的），
@@ -424,6 +471,181 @@ fn fill_rating_from_omdb(
     )
     .map(|n| n > 0)
     .unwrap_or(false)
+}
+
+/* --------------------------- 豆瓣兜底 --------------------------- */
+
+/// 豆瓣刮削的结果，供调用方拼提示语。
+#[derive(Debug, Default, Clone, PartialEq)]
+struct DoubanFill {
+    /// 是否整条接管（TMDb 完全没命中，标题/年份都是豆瓣给的）。
+    took_over: bool,
+    /// 补进去了哪些字段（用于提示「补充：豆瓣简介、豆瓣海报」）。
+    fields: Vec<String>,
+}
+
+/// 豆瓣**整条接管**：TMDb 没命中时的兜底。
+///
+/// 这里可以覆盖 `title`/`year`，因为此刻它们是扫描阶段猜出来的、没有权威来源。
+/// 但只要豆瓣某项为空，就保留原值不动。
+fn apply_douban_takeover(conn: &Connection, id: i64, m: &DoubanMeta) -> Result<DoubanFill, String> {
+    let mut fields = Vec::new();
+    conn.execute(
+        "UPDATE media SET \
+             title          = COALESCE(?2, title), \
+             original_title = COALESCE(?3, original_title), \
+             year           = COALESCE(?4, year), \
+             overview       = COALESCE(?5, overview), \
+             poster_path    = COALESCE(?6, poster_path), \
+             vote_average   = COALESCE(?7, vote_average), \
+             genre          = COALESCE(?8, genre), \
+             source         = ?9, \
+             updated_at     = ?10 \
+         WHERE id = ?1",
+        params![
+            id,
+            m.title.as_deref(),
+            m.original_title.as_deref(),
+            m.year,
+            m.overview.as_deref(),
+            m.poster.as_deref(),
+            m.rating,
+            m.genre.as_deref(),
+            format!("douban:{}", m.douban_id),
+            now_epoch()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    if m.title.is_some() {
+        fields.push("片名".to_string());
+    }
+    if m.overview.is_some() {
+        fields.push("简介".to_string());
+    }
+    if m.poster.is_some() {
+        fields.push("海报".to_string());
+    }
+    if m.rating.is_some() {
+        fields.push("评分".to_string());
+    }
+    if m.genre.is_some() {
+        fields.push("类型".to_string());
+    }
+    // 类型变了要同步左侧栏目（失败不影响刮削结果）
+    if let Some(g) = m.genre.as_deref() {
+        let _ = catalog::link_genre_categories(conn, id, g);
+    }
+    // 工作人员字段没有独立列，挂到 `release_source`（本来就是自由文本）
+    if m.release_date.is_some() || m.directors.is_some() || m.actors.is_some() {
+        let _ = conn.execute(
+            "UPDATE media SET release_source = COALESCE(release_source, ?2) WHERE id = ?1",
+            params![id, douban_crew_line(m)],
+        );
+    }
+    Ok(DoubanFill {
+        took_over: true,
+        fields,
+    })
+}
+
+/// 豆瓣**只补缺失**：TMDb 命中之后跑。
+///
+/// 逐个字段判断，已有的（非空）一律不动，返回真正补进去的字段名。
+fn apply_douban_fill(conn: &Connection, id: i64, m: &DoubanMeta) -> Result<DoubanFill, String> {
+    // 一次读出当前值，逐字段算「谁该补」
+    let row: (Option<String>, Option<String>, Option<String>, Option<f64>, Option<String>) = conn
+        .query_row(
+            "SELECT original_title, overview, poster_path, vote_average, release_source \
+             FROM media WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let (original_title, overview, poster, vote, release_source) = row;
+
+    let mut fields = Vec::new();
+
+    let new_original = merge_text(original_title.as_deref(), m.original_title.as_deref());
+    if new_original.is_some() {
+        fields.push("原名".to_string());
+    }
+    let new_overview = merge_text(overview.as_deref(), m.overview.as_deref());
+    if new_overview.is_some() {
+        fields.push("简介".to_string());
+    }
+    let new_poster = merge_text(poster.as_deref(), m.poster.as_deref());
+    if new_poster.is_some() {
+        fields.push("海报".to_string());
+    }
+    let new_rating = merge_rating(vote, m.rating);
+    if new_rating.is_some() {
+        fields.push("评分".to_string());
+    }
+    // 简介里塞不下的导演/演员/上映日期，拼一行挂到 release_source
+    let crew = douban_crew_line(m);
+    let new_crew = if crew.is_empty() {
+        None
+    } else {
+        merge_text(release_source.as_deref(), Some(&crew))
+    };
+    if new_crew.is_some() {
+        fields.push("上映/主创".to_string());
+    }
+
+    if fields.is_empty() {
+        return Ok(DoubanFill::default());
+    }
+    conn.execute(
+        "UPDATE media SET \
+             original_title = COALESCE(?2, original_title), \
+             overview       = COALESCE(?3, overview), \
+             poster_path    = COALESCE(?4, poster_path), \
+             vote_average   = COALESCE(?5, vote_average), \
+             release_source = COALESCE(?6, release_source), \
+             updated_at     = ?7 \
+         WHERE id = ?1",
+        params![
+            id,
+            new_original,
+            new_overview,
+            new_poster,
+            new_rating,
+            new_crew,
+            now_epoch()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(DoubanFill {
+        took_over: false,
+        fields,
+    })
+}
+
+/// 把豆瓣的导演 / 演员 / 上映日期拼成一行（库里没有各自的列）。
+///
+/// `"上映：2021-10-22　导演：A　主演：B / C"`；三项都空时返回空串。
+fn douban_crew_line(m: &DoubanMeta) -> String {
+    let mut parts = Vec::new();
+    if let Some(d) = m.release_date.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("上映：{d}"));
+    }
+    if let Some(d) = m.directors.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("导演：{d}"));
+    }
+    if let Some(a) = m.actors.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("主演：{a}"));
+    }
+    parts.join("　")
 }
 
 /// TMDb 没给集信息时的兜底：拿 TheTVDB 的季 / 集结构补。
@@ -543,10 +765,119 @@ fn refine_title_with_llm(p: &Providers, conn: &Connection, id: i64, pending: &Pe
     Some((title, improved.year))
 }
 
+/// TMDb 完全没命中时的**豆瓣整条接管**。
+///
+/// 三种结果分别落在 `ScrapeOutcome` 上：
+/// - **刮削成功**：`ok: true`，`message` 里注明来自豆瓣；
+/// - **匹配失败**：`ok: false`，`message: "未在 TMDB / 豆瓣找到匹配条目"`；
+/// - **网络异常**：`ok: false`，`message` 带出具体错误（不把 `Err` 抛给上层，
+///   否则批量刮削会直接中断；单条刮削里用户也看不到是哪一步出了问题）。
+fn douban_takeover(
+    conn: &Connection,
+    p: &Providers,
+    tmdb_key: &str,
+    id: i64,
+    pending: PendingRow,
+    refined: Option<(String, Option<i32>)>,
+) -> Result<ScrapeOutcome, String> {
+    // 大模型认出来的标题如果没有权威来源，也要留着，别让列表里一直显示乱码
+    let llm_title = refined.as_ref().map(|(t, _)| t.clone());
+    let llm_year = refined.as_ref().and_then(|(_, y)| *y);
+
+    // 用「大模型修正后的标题」优先，否则用扫描时的标题
+    let query = llm_title.clone().unwrap_or_else(|| pending.title.clone());
+    let year = llm_year.or(pending.year);
+    let media_type = pending.media_type.clone();
+
+    // 没配 TMDb Key 时，豆瓣是**主力**而不是兜底，失败提示要换个说法
+    let miss_message = if p.has_tmdb(tmdb_key) {
+        "未在 TMDB 找到匹配条目".to_string()
+    } else {
+        "尚未配置 TMDB API Key，且未在豆瓣找到匹配条目".to_string()
+    };
+
+    let Some(client) = p.douban.as_ref() else {
+        // 没启用豆瓣：保持原有行为（把大模型认出的标题写回去即可）
+        persist_llm_hint(conn, id, &llm_title, llm_year);
+        return Ok(ScrapeOutcome {
+            ok: false,
+            media_id: id,
+            tmdb_id: None,
+            title: None,
+            episodes: 0,
+            message: miss_message,
+        });
+    };
+
+    match client.lookup(&query, year) {
+        // ① 刮削成功
+        Ok(Some(meta)) => {
+            let fill = apply_douban_takeover(conn, id, &meta)?;
+            // 剧集：豆瓣给了集数就当作提示（单集行的创建仍依赖 TMDb 的季集结构）
+            let episodes = 0i64;
+            let mut msg = "豆瓣刮削成功".to_string();
+            if !fill.fields.is_empty() {
+                msg.push_str(&format!("（写入：{}）", fill.fields.join("、")));
+            }
+            if media_type == "tv" {
+                if let Some(n) = meta.episodes {
+                    msg.push_str(&format!("，豆瓣标注共 {n} 集"));
+                }
+            }
+            Ok(ScrapeOutcome {
+                ok: true,
+                media_id: id,
+                tmdb_id: None,
+                title: meta.title.clone(),
+                episodes,
+                message: msg,
+            })
+        }
+        // ② 匹配失败：接口通了，但没有可用的候选
+        Ok(None) => {
+            persist_llm_hint(conn, id, &llm_title, llm_year);
+            Ok(ScrapeOutcome {
+                ok: false,
+                media_id: id,
+                tmdb_id: None,
+                title: None,
+                episodes: 0,
+                message: format!("{miss_message}（检索词：{query}）"),
+            })
+        }
+        // ③ 网络异常：超时 / DNS / 非 200 / 被限流
+        Err(e) => {
+            persist_llm_hint(conn, id, &llm_title, llm_year);
+            Ok(ScrapeOutcome {
+                ok: false,
+                media_id: id,
+                tmdb_id: None,
+                title: None,
+                episodes: 0,
+                message: format!("豆瓣访问异常：{e}"),
+            })
+        }
+    }
+}
+
+/// 把大模型认出来的标题/年份落库（TMDb 与豆瓣都没命中时的最后一点价值）。
+fn persist_llm_hint(conn: &Connection, id: i64, title: &Option<String>, year: Option<i32>) {
+    if let Some(t) = title.as_deref().filter(|t| !t.trim().is_empty()) {
+        let _ = conn.execute(
+            "UPDATE media SET title = ?2, year = COALESCE(year, ?3), updated_at = ?4 WHERE id = ?1",
+            params![id, t, year, now_epoch()],
+        );
+    }
+}
+
 /// 刮削一条记录并回填。**纯后台逻辑**，调用方必须保证不在主线程上跑。
+///
+/// `tmdb_key` 只用于判断"有没有 TMDb 主源"（决定豆瓣是主力还是兜底、以及失败提示语），
+/// 真正的 TMDb 客户端在 `p.tmdb` 里。
 fn scrape_one(
     conn: &Connection,
     p: &Providers,
+    tmdb_key: &str,
     id: i64,
     tmdb_id: Option<i64>,
 ) -> Result<ScrapeOutcome, String> {
@@ -567,22 +898,9 @@ fn scrape_one(
     }
 
     let Some(tmdb_id) = resolved else {
-        // 连大模型也救不回来：至少把能认出来的标题写回去，别让列表里一直显示乱码
-        if let Some((t, y)) = refined {
-            let _ = conn.execute(
-                "UPDATE media SET title = ?2, year = COALESCE(year, ?3), updated_at = ?4 \
-                 WHERE id = ?1",
-                params![id, t, y, now_epoch()],
-            );
-        }
-        return Ok(ScrapeOutcome {
-            ok: false,
-            media_id: id,
-            tmdb_id: None,
-            title: None,
-            episodes: 0,
-            message: "未在 TMDB 找到匹配条目".to_string(),
-        });
+        // 连大模型也救不回来 → 交给豆瓣做**整条接管**兜底（若已启用）
+        // 注意这里仍要带上 tmdb_key，用于判断"有没有 TMDb 主源"以决定提示语
+        return douban_takeover(conn, p, tmdb_key, id, pending, refined);
     };
 
     // 2) 取详情并回填
@@ -612,6 +930,22 @@ fn scrape_one(
         extra.push("Fanart 补图");
     }
 
+    // 5) 豆瓣收尾：TMDb 已经给过的字段一律不动，只补它漏掉的中文信息
+    let mut douban_extra: Vec<String> = Vec::new();
+    if let Some(client) = p.douban.as_ref() {
+        // 优先用 TMDb 的标题检索（比扫描标题干净），拿不到就退回扫描标题
+        let query = nonempty_or(&meta.title, &pending.title);
+        let year = meta.year.or(pending.year);
+        match client.lookup(&query, year) {
+            Ok(Some(dm)) => {
+                let fill = apply_douban_fill(conn, id, &dm)?;
+                douban_extra = fill.fields;
+            }
+            // 匹配失败 / 网络异常都不该影响已经成功的 TMDb 刮削，静默跳过
+            Ok(None) | Err(_) => {}
+        }
+    }
+
     Ok(ScrapeOutcome {
         ok: true,
         media_id: id,
@@ -626,6 +960,9 @@ fn scrape_one(
             };
             if !extra.is_empty() {
                 msg.push_str(&format!("（补充：{}）", extra.join("、")));
+            }
+            if !douban_extra.is_empty() {
+                msg.push_str(&format!("（豆瓣补全：{}）", douban_extra.join("、")));
             }
             msg
         },
@@ -681,16 +1018,20 @@ pub async fn scrape_media(
     id: i64,
     tmdb_id: Option<i64>,
 ) -> Result<ScrapeOutcome, String> {
-    let (key, hosts, language) = {
+    let (key, hosts, language, douban_on) = {
         let conn = state.lock().map_err(|e| e.to_string())?;
         (
             load_tmdb_key(&conn),
             load_hosts(&conn),
             load_tmdb_language(&conn),
+            load_douban_config(&conn).0,
         )
     };
-    if key.trim().is_empty() {
-        return Err("尚未配置 TMDB API Key，请先到「设置」填写".to_string());
+    // 只开豆瓣也能刮：此时豆瓣会走「整条接管」那条路。
+    if key.trim().is_empty() && !douban_on {
+        return Err(
+            "尚未配置 TMDB API Key；如果只想用豆瓣刮削，请到「设置」打开豆瓣开关".to_string(),
+        );
     }
 
     // 后台线程用自己的连接：WAL 模式下多连接并发读写是安全的。
@@ -698,7 +1039,7 @@ pub async fn scrape_media(
         let conn = crate::store::db::open(&app).map_err(|e| format!("打开数据库失败: {e}"))?;
         // 后台线程自己读设置装配 provider，不占主线程的连接锁
         let providers = Providers::load(&conn, &key, hosts, &language);
-        scrape_one(&conn, &providers, id, tmdb_id)
+        scrape_one(&conn, &providers, &key, id, tmdb_id)
     })
     .await
     .map_err(|e| format!("刮削任务异常退出: {e}"))?
@@ -736,12 +1077,18 @@ pub async fn scrape_all(
         )
     };
 
-    if key.trim().is_empty() {
+    // 单靠豆瓣也能批量跑（每条走「整条接管」）
+    let douban_on = {
+        let conn = state.lock().map_err(|e| e.to_string())?;
+        load_douban_config(&conn).0
+    };
+    if key.trim().is_empty() && !douban_on {
         return Ok(ScrapeStart {
             started: false,
             total: targets.len() as i64,
             no_key: true,
-            message: "尚未配置 TMDB API Key，请先到「设置」填写".to_string(),
+            message: "尚未配置 TMDB API Key；如果只想用豆瓣刮削，请到「设置」打开豆瓣开关"
+                .to_string(),
         });
     }
     if control.running() {
@@ -809,7 +1156,7 @@ fn run_batch(
         }
         let title = read_title(&conn, id);
         emit(ScrapeProgress::tick(total, ok + failed, ok, failed, title));
-        match scrape_one(&conn, &providers, id, None) {
+        match scrape_one(&conn, &providers, &key, id, None) {
             Ok(r) if r.ok => ok += 1,
             _ => failed += 1,
         }
@@ -918,6 +1265,44 @@ pub struct OmdbInfo {
     pub rating: Option<f64>,
     pub genre: String,
     pub plot: String,
+}
+
+/// 豆瓣查到的信息（设置页「测试」与详情页手动刮削的回执）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoubanInfo {
+    pub douban_id: String,
+    pub title: String,
+    pub original_title: String,
+    pub year: Option<i32>,
+    pub directors: String,
+    pub actors: String,
+    pub genre: String,
+    pub release_date: String,
+    pub rating: Option<f64>,
+    pub overview: String,
+    pub poster: String,
+    /// 剧集集数（电影为 0）。
+    pub episodes: i64,
+}
+
+impl DoubanInfo {
+    fn from_meta(m: &DoubanMeta) -> Self {
+        Self {
+            douban_id: m.douban_id.clone(),
+            title: m.title.clone().unwrap_or_default(),
+            original_title: m.original_title.clone().unwrap_or_default(),
+            year: m.year,
+            directors: m.directors.clone().unwrap_or_default(),
+            actors: m.actors.clone().unwrap_or_default(),
+            genre: m.genre.clone().unwrap_or_default(),
+            release_date: m.release_date.clone().unwrap_or_default(),
+            rating: m.rating,
+            overview: m.overview.clone().unwrap_or_default(),
+            poster: m.poster.clone().unwrap_or_default(),
+            episodes: m.episodes.unwrap_or(0),
+        }
+    }
 }
 
 /// 大模型接入预设：推荐的排在最前，其余是同协议的备选。
@@ -1079,6 +1464,176 @@ pub async fn omdb_lookup(
     })
     .await
     .map_err(|e| format!("OMDb 查询任务异常退出: {e}"))?
+}
+
+/* --------------------------- 豆瓣入口 --------------------------- */
+
+/// 搜索豆瓣候选（供详情页手动匹配 / 设置页试检索）。
+///
+/// 不返回一堆字段，只回 `DoubanInfo` 列表——用户要的是「挑一条」，
+/// 完整元数据等确认后再拉。
+#[tauri::command]
+pub async fn search_douban(
+    state: State<'_, Mutex<Connection>>,
+    query: String,
+) -> Result<Vec<DoubanInfo>, String> {
+    let (enabled, cookie, hosts) = {
+        let conn = state.lock().map_err(|e| e.to_string())?;
+        let (enabled, cookie) = load_douban_config(&conn);
+        (enabled, cookie, load_hosts(&conn))
+    };
+    if !enabled {
+        return Err("豆瓣刮削未启用，请先到「设置」打开".to_string());
+    }
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = DoubanClient::with_hosts(true, cookie, &hosts);
+        let items = client.search(&query)?;
+        // 只取前若干条候选，逐条拉详情（豆瓣限流不严但没必要时也不刷）
+        let mut out = Vec::new();
+        for it in items.iter().take(DOUBAN_SEARCH_LIMIT) {
+            let Some(id) = it.usable_id() else { continue };
+            let kind = it.normalized_kind().unwrap_or("movie");
+            match client.detail(kind, id) {
+                Ok(d) => out.push(DoubanInfo::from_meta(&DoubanMeta::from_detail(&d))),
+                // 某一条拉不到详情就跳过，不要把整次搜索判成失败
+                Err(_) => continue,
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("豆瓣搜索任务异常退出: {e}"))?
+}
+
+/// 搜索时最多拉几条详情。
+const DOUBAN_SEARCH_LIMIT: usize = 8;
+
+/// 测试豆瓣连通性（设置页「测试连接」）：真实发一次检索 + 详情请求。
+///
+/// 三种结果明确区分：
+/// - 成功：`Ok("连接正常，命中《沙丘》(2021) 评分 7.7")`
+/// - 匹配失败：`Err("连接正常，但豆瓣没有「xxx」的匹配条目")`
+/// - 网络异常：`Err("豆瓣访问异常：...")`
+#[tauri::command]
+pub async fn douban_test(
+    state: State<'_, Mutex<Connection>>,
+) -> Result<String, String> {
+    let (enabled, cookie, hosts) = {
+        let conn = state.lock().map_err(|e| e.to_string())?;
+        let (enabled, cookie) = load_douban_config(&conn);
+        (enabled, cookie, load_hosts(&conn))
+    };
+    if !enabled {
+        return Err("豆瓣刮削未启用，请先打开开关".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = DoubanClient::with_hosts(true, cookie, &hosts);
+        match client.lookup(DOUBAN_TEST_QUERY, None) {
+            Ok(Some(m)) => {
+                let mut s = format!(
+                    "连接正常，命中《{}》",
+                    m.title.as_deref().unwrap_or("(无标题)")
+                );
+                if let Some(y) = m.year {
+                    s.push_str(&format!("({y})"));
+                }
+                match m.rating {
+                    Some(r) => s.push_str(&format!(" 评分 {r}")),
+                    None => s.push_str(" 暂无评分"),
+                }
+                Ok(s)
+            }
+            Ok(None) => Err(format!(
+                "连接正常，但豆瓣没有「{DOUBAN_TEST_QUERY}」的匹配条目"
+            )),
+            Err(e) => Err(format!("豆瓣访问异常：{e}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("豆瓣测试任务异常退出: {e}"))?
+}
+
+/// 连通性测试用的固定检索词（挑一部稳定存在的经典片）。
+const DOUBAN_TEST_QUERY: &str = "沙丘";
+
+/// 手动用豆瓣刮削指定条目（详情页入口）。
+///
+/// 语义与自动流程一致：TMDb 有结果时只补缺失，没有时整条接管。
+#[tauri::command]
+pub async fn douban_apply(
+    app: AppHandle,
+    state: State<'_, Mutex<Connection>>,
+    media_id: i64,
+    query: Option<String>,
+    year: Option<i32>,
+) -> Result<ScrapeOutcome, String> {
+    let (enabled, cookie, hosts) = {
+        let conn = state.lock().map_err(|e| e.to_string())?;
+        let (enabled, cookie) = load_douban_config(&conn);
+        (enabled, cookie, load_hosts(&conn))
+    };
+    if !enabled {
+        return Err("豆瓣刮削未启用，请先到「设置」打开".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::store::db::open(&app).map_err(|e| format!("打开数据库失败: {e}"))?;
+        let pending = read_pending(&conn, media_id)?;
+        let q = query
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| pending.title.clone());
+        let y = year.or(pending.year);
+
+        let client = DoubanClient::with_hosts(true, cookie, &hosts);
+        match client.lookup(&q, y) {
+            // ① 刮削成功
+            Ok(Some(m)) => {
+                // 当前是否已有 TMDb 元数据：有 → 只补缺失；没有 → 整条接管
+                let has_tmdb: Option<i64> = conn
+                    .query_row(
+                        "SELECT tmdb_id FROM media WHERE id = ?1",
+                        params![media_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(None);
+                let fill = if has_tmdb.is_some() {
+                    apply_douban_fill(&conn, media_id, &m)?
+                } else {
+                    apply_douban_takeover(&conn, media_id, &m)?
+                };
+                let msg = if fill.took_over {
+                    format!("豆瓣刮削成功（写入：{}）", fill.fields.join("、"))
+                } else if fill.fields.is_empty() {
+                    "豆瓣刮削成功，但没有需要补充的字段".to_string()
+                } else {
+                    format!("豆瓣补全成功（补充：{}）", fill.fields.join("、"))
+                };
+                Ok(ScrapeOutcome {
+                    ok: true,
+                    media_id,
+                    tmdb_id: has_tmdb,
+                    title: m.title.clone(),
+                    episodes: 0,
+                    message: msg,
+                })
+            }
+            // ② 匹配失败
+            Ok(None) => Ok(ScrapeOutcome {
+                ok: false,
+                media_id,
+                tmdb_id: None,
+                title: None,
+                episodes: 0,
+                message: format!("未在豆瓣找到匹配条目（检索词：{q}）"),
+            }),
+            // ③ 网络异常
+            Err(e) => Err(format!("豆瓣访问异常：{e}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("豆瓣刮削任务异常退出: {e}"))?
 }
 
 #[cfg(test)]

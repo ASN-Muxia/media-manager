@@ -16,6 +16,8 @@ const KEY_LANGUAGE: &str = "tmdbLanguage";
 const KEY_TVDB_KEY: &str = "tvdbKey";
 const KEY_FANART_KEY: &str = "fanartKey";
 const KEY_OMDB_KEY: &str = "omdbKey";
+const KEY_DOUBAN_ENABLED: &str = "doubanEnabled";
+const KEY_DOUBAN_COOKIE: &str = "doubanCookie";
 const KEY_LLM_ENABLED: &str = "llmEnabled";
 const KEY_LLM_BASE_URL: &str = "llmBaseUrl";
 const KEY_LLM_API_KEY: &str = "llmApiKey";
@@ -50,6 +52,14 @@ pub struct Settings {
     /// OMDb API Key（IMDb 评分补充）。
     #[serde(default)]
     pub omdb_key: String,
+    /// 豆瓣刮削总开关。**默认关闭**——豆瓣没有官方 API，接口随时可能变动，
+    /// 也涉及第三方站点的使用条款，交给用户自己决定要不要开。
+    #[serde(default)]
+    pub douban_enabled: bool,
+    /// 豆瓣 Cookie（可选）。带上登录态能显著降低被要求验证码的概率，
+    /// 留空也能用（匿名请求受到更严格的限流）。
+    #[serde(default)]
+    pub douban_cookie: String,
     /// 大模型脏文件名解析总开关（关掉就完全不联网）。
     #[serde(default)]
     pub llm_enabled: bool,
@@ -79,6 +89,8 @@ impl Default for Settings {
             tvdb_key: String::new(),
             fanart_key: String::new(),
             omdb_key: String::new(),
+            douban_enabled: false,
+            douban_cookie: String::new(),
             llm_enabled: false,
             llm_base_url: String::new(),
             llm_api_key: String::new(),
@@ -153,6 +165,16 @@ pub fn load_omdb_key(conn: &Connection) -> String {
     read_value(conn, KEY_OMDB_KEY).unwrap_or_default()
 }
 
+/// 读取豆瓣刮削配置：`(是否启用, Cookie)`。
+///
+/// 默认关闭 —— 没写过这个键就是 `false`，不会因为升级而偷偷开始联网抓豆瓣。
+pub fn load_douban_config(conn: &Connection) -> (bool, String) {
+    let enabled = read_value(conn, KEY_DOUBAN_ENABLED)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    (enabled, read_value(conn, KEY_DOUBAN_COOKIE).unwrap_or_default())
+}
+
 /// 读取大模型配置（脏文件名解析增强层，可选）。
 pub fn load_llm_config(conn: &Connection) -> crate::provider::llm::LlmConfig {
     crate::provider::llm::LlmConfig {
@@ -192,6 +214,8 @@ pub fn get_settings(state: State<'_, Mutex<Connection>>) -> Result<Settings, Str
         tvdb_key: load_tvdb_key(&conn),
         fanart_key: load_fanart_key(&conn),
         omdb_key: load_omdb_key(&conn),
+        douban_enabled: load_douban_config(&conn).0,
+        douban_cookie: load_douban_config(&conn).1,
         llm_enabled: load_llm_config(&conn).enabled,
         llm_base_url: read_value(&conn, KEY_LLM_BASE_URL).unwrap_or_default(),
         llm_api_key: read_value(&conn, KEY_LLM_API_KEY).unwrap_or_default(),
@@ -218,6 +242,14 @@ pub fn set_settings(
     write_value(&conn, KEY_TVDB_KEY, settings.tvdb_key.trim()).map_err(|e| e.to_string())?;
     write_value(&conn, KEY_FANART_KEY, settings.fanart_key.trim()).map_err(|e| e.to_string())?;
     write_value(&conn, KEY_OMDB_KEY, settings.omdb_key.trim()).map_err(|e| e.to_string())?;
+    write_value(
+        &conn,
+        KEY_DOUBAN_ENABLED,
+        if settings.douban_enabled { "1" } else { "0" },
+    )
+    .map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_DOUBAN_COOKIE, settings.douban_cookie.trim())
+        .map_err(|e| e.to_string())?;
     write_value(
         &conn,
         KEY_LLM_ENABLED,
@@ -327,9 +359,30 @@ mod tests {
         assert_eq!(load_omdb_key(&conn), "omdb-1");
     }
 
+    /// 豆瓣默认必须是关闭的：老库升级上来不能因为多了个 provider 就悄悄开始联网。
     #[test]
-    fn llm_config_roundtrip_and_defaults_off() {
+    fn douban_defaults_off_and_roundtrips() {
         let conn = memory_db();
+        let (enabled, cookie) = load_douban_config(&conn);
+        assert!(!enabled, "豆瓣刮削默认必须关闭");
+        assert!(cookie.is_empty());
+
+        write_value(&conn, KEY_DOUBAN_ENABLED, "1").unwrap();
+        write_value(&conn, KEY_DOUBAN_COOKIE, "bid=abc; dbcl2=xyz").unwrap();
+        let (enabled, cookie) = load_douban_config(&conn);
+        assert!(enabled);
+        assert_eq!(cookie, "bid=abc; dbcl2=xyz");
+
+        // `true` 这种写法也要认（前端可能按布尔序列化）
+        write_value(&conn, KEY_DOUBAN_ENABLED, "true").unwrap();
+        assert!(load_douban_config(&conn).0);
+
+        write_value(&conn, KEY_DOUBAN_ENABLED, "0").unwrap();
+        assert!(!load_douban_config(&conn).0);
+    }
+
+    #[test]
+    fn llm_config_roundtrip_and_defaults_off() {        let conn = memory_db();
         assert!(!load_llm_config(&conn).enabled, "默认必须关闭");
 
         write_value(&conn, KEY_LLM_ENABLED, "1").unwrap();

@@ -21,6 +21,10 @@ export const useSettingsStore = defineStore("settings", () => {
   const fanartKey = ref("");
   /** OMDb：IMDb 评分补充。 */
   const omdbKey = ref("");
+  /** 豆瓣：中文元数据兜底（非官方接口，默认关闭）。 */
+  const doubanEnabled = ref(false);
+  /** 豆瓣 Cookie（可选）：带上登录态能降低被要求验证码的概率。 */
+  const doubanCookie = ref("");
 
   /* ---------------- 大模型（可选增强层，默认关闭） ---------------- */
   const llmEnabled = ref(false);
@@ -65,6 +69,8 @@ export const useSettingsStore = defineStore("settings", () => {
       tvdbKey.value = s.tvdbKey ?? "";
       fanartKey.value = s.fanartKey ?? "";
       omdbKey.value = s.omdbKey ?? "";
+      doubanEnabled.value = Boolean(s.doubanEnabled);
+      doubanCookie.value = s.doubanCookie ?? "";
       llmEnabled.value = Boolean(s.llmEnabled);
       llmBaseUrl.value = s.llmBaseUrl ?? "";
       llmApiKey.value = s.llmApiKey ?? "";
@@ -91,6 +97,8 @@ export const useSettingsStore = defineStore("settings", () => {
         tvdbKey: tvdbKey.value.trim(),
         fanartKey: fanartKey.value.trim(),
         omdbKey: omdbKey.value.trim(),
+        doubanEnabled: doubanEnabled.value,
+        doubanCookie: doubanCookie.value.trim(),
         llmEnabled: llmEnabled.value,
         llmBaseUrl: llmBaseUrl.value.trim(),
         llmApiKey: llmApiKey.value.trim(),
@@ -127,6 +135,7 @@ export const useSettingsStore = defineStore("settings", () => {
   return {
     tmdbKey, mediaDirs, potPlayerPath, hostsText, tmdbLanguage, languageOptions,
     tvdbKey, fanartKey, omdbKey,
+    doubanEnabled, doubanCookie,
     llmEnabled, llmBaseUrl, llmApiKey, llmModel, llmVisionModel, llmVisionBaseUrl,
     loaded, saving, error,
     load, save, addDir, removeDir, hostsLines, applyLlmPreset,

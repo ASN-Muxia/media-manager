@@ -6,8 +6,8 @@
 import { onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
-  dbInfo, detectPlayer, llmParseName, llmPresets, omdbLookup, openDataDir,
-  readReadyMarker, runtimeInfo, tmdbTest, type LlmPreset,
+  dbInfo, detectPlayer, doubanTest, llmParseName, llmPresets, omdbLookup, openDataDir,
+  readReadyMarker, runtimeInfo, searchDouban, tmdbTest, type LlmPreset,
 } from "../api/commands";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useMediaStore } from "../stores/mediaStore";
@@ -145,6 +145,9 @@ const probeResult = ref<string>("");
 const probingLlm = ref(false);
 const omdbTitle = ref("");
 const omdbResult = ref("");
+const doubanQuery = ref("");
+const doubanResult = ref("");
+const probingDouban = ref(false);
 
 onMounted(async () => {
   try {
@@ -195,6 +198,46 @@ async function onOmdbProbe(): Promise<void> {
       : `《${r.title}》无 IMDb 评分`;
   } catch (e) {
     omdbResult.value = "❌ " + String(e);
+  }
+}
+
+/** 试一次豆瓣，确认开关与网络都通。 */
+async function onDoubanProbe(): Promise<void> {
+  doubanResult.value = "";
+  probingDouban.value = true;
+  try {
+    doubanResult.value = "✅ " + (await doubanTest());
+  } catch (e) {
+    doubanResult.value = "❌ " + String(e);
+  } finally {
+    probingDouban.value = false;
+  }
+}
+
+/** 按片名搜豆瓣，展示命中的字段，用户能直接看出刮削会写入什么。 */
+async function onDoubanSearch(): Promise<void> {
+  doubanResult.value = "";
+  if (!doubanQuery.value.trim()) return;
+  probingDouban.value = true;
+  try {
+    const list = await searchDouban(doubanQuery.value.trim());
+    if (list.length === 0) {
+      doubanResult.value = `未找到「${doubanQuery.value.trim()}」的匹配条目`;
+      return;
+    }
+    const first = list[0];
+    const bits = [
+      `${first.title}${first.year ? `（${first.year}）` : ""}`,
+      first.rating != null ? `评分 ${first.rating.toFixed(1)}` : "暂无评分",
+      first.directors ? `导演 ${first.directors}` : "",
+      first.genre || "",
+      first.poster ? "有海报" : "无海报",
+    ].filter(Boolean);
+    doubanResult.value = `命中 ${list.length} 条 · ${bits.join("｜")}`;
+  } catch (e) {
+    doubanResult.value = "❌ " + String(e);
+  } finally {
+    probingDouban.value = false;
   }
 }
 
@@ -259,8 +302,8 @@ async function onOpenDataDir(): Promise<void> {
       <p class="panel-hint split">
         <strong>数据源分工</strong>：TMDb 负责片名 / 简介 / 评分 / 图（权威）；
         TheTVDB 负责剧集的季 / 集结构；Fanart.tv 在 TMDb 缺图时补海报与背景；
-        OMDb 只补 IMDb 评分。下面三项都是<strong>可选</strong>的，留空就整段跳过，
-        不影响主链路。
+        OMDb 只补 IMDb 评分；豆瓣负责<strong>中文元数据兜底</strong>。
+        上面四项都是<strong>可选</strong>的，留空就整段跳过，不影响主链路。
       </p>
       <div class="field">
         <label>TheTVDB API Key（可选 · 剧集季 / 集结构）</label>
@@ -279,6 +322,53 @@ async function onOpenDataDir(): Promise<void> {
         </div>
         <p v-if="omdbResult" class="panel-hint">{{ omdbResult }}</p>
       </div>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">
+        豆瓣刮削
+        <span class="badge">中文兜底 · 默认关闭</span>
+      </h3>
+      <p class="panel-hint split">
+        豆瓣<strong>没有官方开放 API</strong>，这里走的是它的公开检索与移动端接口，
+        存在随时变动或限流的风险，因此默认<strong>关闭</strong>，由你自行决定是否启用。
+        启用后：TMDb <strong>没命中</strong>时，豆瓣会<strong>整条接管</strong>
+        （写入片名 / 年份 / 导演 / 演员 / 类型 / 上映日期 / 评分 / 简介 / 海报）；
+        TMDb <strong>命中</strong>时，豆瓣只补它没给的中文字段，已有的一律不覆盖。
+      </p>
+      <div class="field">
+        <label class="switch">
+          <input v-model="store.doubanEnabled" type="checkbox" />
+          <span>启用豆瓣刮削</span>
+        </label>
+      </div>
+      <div class="field">
+        <label>豆瓣 Cookie（可选 · 可降低验证码概率）</label>
+        <input
+          v-model="store.doubanCookie"
+          type="password"
+          placeholder="留空也能用；浏览器登录豆瓣后复制 Cookie 可提高稳定性"
+        />
+      </div>
+      <div class="field">
+        <label>连通性 / 检索测试</label>
+        <div class="add">
+          <input
+            v-model="doubanQuery"
+            class="narrow"
+            placeholder="片名，如 沙丘"
+            @keyup.enter="onDoubanSearch"
+          />
+          <button class="mini" :disabled="probingDouban" @click="onDoubanSearch">搜豆瓣</button>
+          <button class="mini" :disabled="probingDouban" @click="onDoubanProbe">测试连接</button>
+        </div>
+        <p v-if="doubanResult" class="panel-hint">{{ doubanResult }}</p>
+      </div>
+      <p class="panel-hint split">
+        <strong>使用提示</strong>：改完开关与 Cookie 记得先点最下方的「保存设置」。
+        刮削入口仍在条目的详情页——「刮削」按钮会按 TMDb → 豆瓣的顺序自动跑完；
+        也可以在那里用豆瓣单独重刮一次。
+      </p>
     </div>
 
     <div class="panel">

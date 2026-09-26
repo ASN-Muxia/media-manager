@@ -92,6 +92,23 @@ export interface OmdbInfo {
   plot: string;
 }
 
+/** 豆瓣查到的信息（中日文元数据兜底）。 */
+export interface DoubanInfo {
+  doubanId: string;
+  title: string;
+  originalTitle: string;
+  year: number | null;
+  directors: string;
+  actors: string;
+  genre: string;
+  releaseDate: string;
+  rating: number | null;
+  overview: string;
+  poster: string;
+  /** 剧集集数（电影为 0）。 */
+  episodes: number;
+}
+
 export interface Episode {
   id: number;
   media_id: number;
@@ -129,6 +146,10 @@ export interface Settings {
   fanartKey: string;
   /** OMDb API Key（IMDb 评分补充；可选） */
   omdbKey: string;
+  /** 豆瓣刮削总开关。**默认关闭** —— 豆瓣非官方接口且涉第三方条款，由用户自行决定 */
+  doubanEnabled: boolean;
+  /** 豆瓣 Cookie（可选，带登录态可降低验证码概率） */
+  doubanCookie: string;
   /** 大模型脏文件名解析总开关（**可选增强层**，默认关闭） */
   llmEnabled: boolean;
   llmBaseUrl: string;
@@ -642,6 +663,29 @@ export function tvdbApply(mediaId: number, tvdbId?: number | null): Promise<Tvdb
 /** 查询 OMDb（评分补充）。 */
 export function omdbLookup(title: string, year?: number | null): Promise<OmdbInfo> {
   return invoke<OmdbInfo>("omdb_lookup", { title, year: year ?? null });
+}
+
+/** 搜索豆瓣候选（设置页试检索 / 详情页手动匹配）。 */
+export function searchDouban(query: string): Promise<DoubanInfo[]> {
+  return invoke<DoubanInfo[]>("search_douban", { query });
+}
+
+/** 用豆瓣刮削指定条目（TMDb 已有结果时只补缺失，否则整条接管）。 */
+export function doubanApply(
+  mediaId: number,
+  query?: string | null,
+  year?: number | null,
+): Promise<ScrapeOutcome> {
+  return invoke<ScrapeOutcome>("douban_apply", {
+    mediaId,
+    query: query ?? null,
+    year: year ?? null,
+  });
+}
+
+/** 测试豆瓣连通性。成功返回可读文案；匹配失败 / 网络异常都作为异常抛出。 */
+export function doubanTest(): Promise<string> {
+  return invoke<string>("douban_test");
 }
 
 /** 大模型接入预设（推荐的排第一）。 */
