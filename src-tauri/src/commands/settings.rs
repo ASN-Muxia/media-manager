@@ -11,6 +11,17 @@ use tauri::State;
 const KEY_TMDB_KEY: &str = "tmdbKey";
 const KEY_MEDIA_DIRS: &str = "mediaDirs";
 const KEY_POTPLAYER: &str = "potPlayerPath";
+const KEY_HOSTS: &str = "hosts";
+const KEY_LANGUAGE: &str = "tmdbLanguage";
+const KEY_TVDB_KEY: &str = "tvdbKey";
+const KEY_FANART_KEY: &str = "fanartKey";
+const KEY_OMDB_KEY: &str = "omdbKey";
+const KEY_LLM_ENABLED: &str = "llmEnabled";
+const KEY_LLM_BASE_URL: &str = "llmBaseUrl";
+const KEY_LLM_API_KEY: &str = "llmApiKey";
+const KEY_LLM_MODEL: &str = "llmModel";
+const KEY_LLM_VISION_MODEL: &str = "llmVisionModel";
+const KEY_LLM_VISION_BASE_URL: &str = "llmVisionBaseUrl";
 
 /// 设置结构体，字段与前端 settingsStore 一一对应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +33,39 @@ pub struct Settings {
     pub media_dirs: Vec<String>,
     #[serde(default)]
     pub pot_player_path: String,
+    /// 自定义域名解析（hosts 文件格式，一行一条：`IP 域名`）。
+    /// 只作用于本应用自己发出的 HTTP 请求（TMDB 刮削），不改系统 hosts，
+    /// 也不影响 WebView 加载的图片（见设置页说明）。
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// 元数据语言（`zh-CN` / `en-US` …）。留空按 `tmdb::DEFAULT_LANGUAGE` 处理。
+    #[serde(default)]
+    pub tmdb_language: String,
+    /// TheTVDB API Key（剧集季 / 集结构）。
+    #[serde(default)]
+    pub tvdb_key: String,
+    /// Fanart.tv API Key（海报 / 背景补充图源）。
+    #[serde(default)]
+    pub fanart_key: String,
+    /// OMDb API Key（IMDb 评分补充）。
+    #[serde(default)]
+    pub omdb_key: String,
+    /// 大模型脏文件名解析总开关（关掉就完全不联网）。
+    #[serde(default)]
+    pub llm_enabled: bool,
+    /// 大模型接口地址（OpenAI 兼容）。
+    #[serde(default)]
+    pub llm_base_url: String,
+    #[serde(default)]
+    pub llm_api_key: String,
+    #[serde(default)]
+    pub llm_model: String,
+    /// 视觉模型名（看截图兜底用）；留空表示不启用视觉兜底。
+    #[serde(default)]
+    pub llm_vision_model: String,
+    /// 视觉模型接口地址；留空则与 `llmBaseUrl` 同址。
+    #[serde(default)]
+    pub llm_vision_base_url: String,
 }
 
 impl Default for Settings {
@@ -30,6 +74,17 @@ impl Default for Settings {
             tmdb_key: String::new(),
             media_dirs: Vec::new(),
             pot_player_path: String::new(),
+            hosts: Vec::new(),
+            tmdb_language: crate::tmdb::DEFAULT_LANGUAGE.to_string(),
+            tvdb_key: String::new(),
+            fanart_key: String::new(),
+            omdb_key: String::new(),
+            llm_enabled: false,
+            llm_base_url: String::new(),
+            llm_api_key: String::new(),
+            llm_model: String::new(),
+            llm_vision_model: String::new(),
+            llm_vision_base_url: String::new(),
         }
     }
 }
@@ -66,6 +121,52 @@ pub fn load_tmdb_key(conn: &Connection) -> String {
     read_value(conn, KEY_TMDB_KEY).unwrap_or_default()
 }
 
+/// 读取自定义 hosts 映射（供刮削命令复用）。
+pub fn load_hosts(conn: &Connection) -> Vec<String> {
+    read_value(conn, KEY_HOSTS)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// 读取元数据语言（供刮削命令复用）；未配置时回落默认语言。
+pub fn load_tmdb_language(conn: &Connection) -> String {
+    let v = read_value(conn, KEY_LANGUAGE).unwrap_or_default();
+    if v.trim().is_empty() {
+        crate::tmdb::DEFAULT_LANGUAGE.to_string()
+    } else {
+        v.trim().to_string()
+    }
+}
+
+/// 读取 TheTVDB Key（剧集季 / 集结构）。
+pub fn load_tvdb_key(conn: &Connection) -> String {
+    read_value(conn, KEY_TVDB_KEY).unwrap_or_default()
+}
+
+/// 读取 Fanart.tv Key（补充图源）。
+pub fn load_fanart_key(conn: &Connection) -> String {
+    read_value(conn, KEY_FANART_KEY).unwrap_or_default()
+}
+
+/// 读取 OMDb Key（评分补充）。
+pub fn load_omdb_key(conn: &Connection) -> String {
+    read_value(conn, KEY_OMDB_KEY).unwrap_or_default()
+}
+
+/// 读取大模型配置（脏文件名解析增强层，可选）。
+pub fn load_llm_config(conn: &Connection) -> crate::llm::LlmConfig {
+    crate::llm::LlmConfig {
+        enabled: read_value(conn, KEY_LLM_ENABLED)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        base_url: read_value(conn, KEY_LLM_BASE_URL).unwrap_or_default(),
+        api_key: read_value(conn, KEY_LLM_API_KEY).unwrap_or_default(),
+        model: read_value(conn, KEY_LLM_MODEL).unwrap_or_default(),
+        vision_model: read_value(conn, KEY_LLM_VISION_MODEL).unwrap_or_default(),
+        vision_base_url: read_value(conn, KEY_LLM_VISION_BASE_URL).unwrap_or_default(),
+    }
+}
+
 fn write_value(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) \
@@ -86,6 +187,17 @@ pub fn get_settings(state: State<'_, Mutex<Connection>>) -> Result<Settings, Str
         tmdb_key: read_value(&conn, KEY_TMDB_KEY).unwrap_or_default(),
         media_dirs,
         pot_player_path: read_value(&conn, KEY_POTPLAYER).unwrap_or_default(),
+        hosts: load_hosts(&conn),
+        tmdb_language: load_tmdb_language(&conn),
+        tvdb_key: load_tvdb_key(&conn),
+        fanart_key: load_fanart_key(&conn),
+        omdb_key: load_omdb_key(&conn),
+        llm_enabled: load_llm_config(&conn).enabled,
+        llm_base_url: read_value(&conn, KEY_LLM_BASE_URL).unwrap_or_default(),
+        llm_api_key: read_value(&conn, KEY_LLM_API_KEY).unwrap_or_default(),
+        llm_model: read_value(&conn, KEY_LLM_MODEL).unwrap_or_default(),
+        llm_vision_model: read_value(&conn, KEY_LLM_VISION_MODEL).unwrap_or_default(),
+        llm_vision_base_url: read_value(&conn, KEY_LLM_VISION_BASE_URL).unwrap_or_default(),
     })
 }
 
@@ -97,9 +209,28 @@ pub fn set_settings(
 ) -> Result<(), String> {
     let conn = state.lock().map_err(|e| e.to_string())?;
     let dirs = serde_json::to_string(&settings.media_dirs).map_err(|e| e.to_string())?;
+    let hosts = serde_json::to_string(&settings.hosts).map_err(|e| e.to_string())?;
     write_value(&conn, KEY_TMDB_KEY, &settings.tmdb_key).map_err(|e| e.to_string())?;
     write_value(&conn, KEY_MEDIA_DIRS, &dirs).map_err(|e| e.to_string())?;
     write_value(&conn, KEY_POTPLAYER, &settings.pot_player_path).map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_HOSTS, &hosts).map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_LANGUAGE, settings.tmdb_language.trim()).map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_TVDB_KEY, settings.tvdb_key.trim()).map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_FANART_KEY, settings.fanart_key.trim()).map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_OMDB_KEY, settings.omdb_key.trim()).map_err(|e| e.to_string())?;
+    write_value(
+        &conn,
+        KEY_LLM_ENABLED,
+        if settings.llm_enabled { "1" } else { "0" },
+    )
+    .map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_LLM_BASE_URL, settings.llm_base_url.trim()).map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_LLM_API_KEY, settings.llm_api_key.trim()).map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_LLM_MODEL, settings.llm_model.trim()).map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_LLM_VISION_MODEL, settings.llm_vision_model.trim())
+        .map_err(|e| e.to_string())?;
+    write_value(&conn, KEY_LLM_VISION_BASE_URL, settings.llm_vision_base_url.trim())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -160,6 +291,55 @@ mod tests {
     fn missing_key_returns_none() {
         let conn = memory_db();
         assert!(read_value(&conn, KEY_MEDIA_DIRS).is_none());
+    }
+
+    /// 语言没配过（老库升级上来就是这种情况）必须回落默认，不能把空串发给 TMDB。
+    #[test]
+    fn language_falls_back_to_default_when_unset() {
+        let conn = memory_db();
+        assert_eq!(load_tmdb_language(&conn), crate::tmdb::DEFAULT_LANGUAGE);
+    }
+
+    #[test]
+    fn language_roundtrip_and_blank_is_default() {
+        let conn = memory_db();
+        write_value(&conn, KEY_LANGUAGE, "en-US").unwrap();
+        assert_eq!(load_tmdb_language(&conn), "en-US");
+
+        write_value(&conn, KEY_LANGUAGE, "  ").unwrap();
+        assert_eq!(load_tmdb_language(&conn), crate::tmdb::DEFAULT_LANGUAGE);
+    }
+
+    /// 新增供应方的 Key 也要能存能读（重启后不丢）
+    #[test]
+    fn provider_keys_roundtrip() {
+        let conn = memory_db();
+        for (k, v) in [
+            (KEY_TVDB_KEY, "tvdb-1"),
+            (KEY_FANART_KEY, "fanart-1"),
+            (KEY_OMDB_KEY, "omdb-1"),
+        ] {
+            write_value(&conn, k, v).unwrap();
+            assert_eq!(read_value(&conn, k).as_deref(), Some(v));
+        }
+        assert_eq!(load_tvdb_key(&conn), "tvdb-1");
+        assert_eq!(load_fanart_key(&conn), "fanart-1");
+        assert_eq!(load_omdb_key(&conn), "omdb-1");
+    }
+
+    #[test]
+    fn llm_config_roundtrip_and_defaults_off() {
+        let conn = memory_db();
+        assert!(!load_llm_config(&conn).enabled, "默认必须关闭");
+
+        write_value(&conn, KEY_LLM_ENABLED, "1").unwrap();
+        write_value(&conn, KEY_LLM_BASE_URL, "https://api.deepseek.com/v1").unwrap();
+        write_value(&conn, KEY_LLM_MODEL, "deepseek-chat").unwrap();
+        let c = load_llm_config(&conn);
+        assert!(c.enabled);
+        assert!(c.usable());
+        assert_eq!(c.base_url(), "https://api.deepseek.com/v1");
+        assert!(!c.vision_usable(), "没配视觉模型就不启用视觉兜底");
     }
 
     #[test]

@@ -1,3 +1,18 @@
-' ä¸€é”®å¯åŠ¨åª’ä½“åº“ä¸»ç¨‹åºï¼šGUI å­ç³»ç»Ÿ exeï¼Œä¸ä¼šäº§ç”Ÿä»»ä½•æ§åˆ¶å°çª—å£ã€‚
-' ç”¨æ³•ï¼šåŒå‡»æœ¬æ–‡ä»¶ã€‚è‹¥æç¤º exe ä¸å­˜åœ¨ï¼Œè¯·å…ˆè¿è¡Œä¸€æ¬¡ start.bat å®Œæˆæ„å»ºã€‚
-CreateObject("Wscript.Shell").Run """G:\AI agent\media-manager\src-tauri\target\debug\media-manager.exe""", 1, False
+Option Explicit
+' Ò»¼üÆô¶¯Ã½Ìå¿âÖ÷³ÌĞò£ºGUI ×ÓÏµÍ³ exe£¬²»»á²úÉúÈÎºÎ¿ØÖÆÌ¨´°¿Ú¡£
+' ÓÃ·¨£ºË«»÷±¾ÎÄ¼ş¡£ÈôÌáÊ¾ exe ²»´æÔÚ£¬ÇëÏÈÔËĞĞÒ»´Î start.bat Íê³É¹¹½¨¡£
+Dim shell, fso, exe, alt
+exe = "G:\AI agent\media-manager\src-tauri\target\debug\media-manager.exe"
+alt = "G:\AI agent\media-manager\src-tauri\target\release\media-manager.exe"
+Set fso = CreateObject("Scripting.FileSystemObject")
+If Not fso.FileExists(exe) Then
+    If fso.FileExists(alt) Then
+        exe = alt
+    Else
+        MsgBox "ÕÒ²»µ½Ö÷³ÌĞò£º" & vbCrLf & exe & vbCrLf & vbCrLf & _
+               "ÇëÏÈË«»÷ start.bat Íê³ÉÒ»´Î¹¹½¨£¬ÔÙµã±¾ÎÄ¼şÆô¶¯¡£", 16, "Ó°ÊÓ¿â"
+        WScript.Quit 1
+    End If
+End If
+Set shell = CreateObject("Wscript.Shell")
+shell.Run """" & exe & """", 1, False

@@ -7,8 +7,9 @@ rem  media-manager 一键盘点（验证整个项目是否健康）
 rem  双击本文件即可，依次执行：
 rem    1. 前端构建        vite build
 rem    2. 前端类型检查    tsc --noEmit
-rem    3. Rust 测试       cargo test
-rem    4. Rust 编译链接   cargo build
+rem    3. 前端单元测试    vitest run
+rem    4. Rust 测试       cargo test
+rem    5. Rust 编译链接   cargo build
 rem  全部通过则退出码为 0。
 rem
 rem  本文件为 GBK 编码，请勿用 UTF-8 覆盖保存，否则 cmd 解析会出错。
@@ -17,7 +18,8 @@ rem ==========================================================================
 set "MM_ROOT=%~dp0"
 if "%MM_ROOT:~-1%"=="\" set "MM_ROOT=%MM_ROOT:~0,-1%"
 
-if not defined MM_NODE set "MM_NODE=C:\Users\31506\node\node-v22.23.3-win-x64\node.exe"
+if not defined MM_NODE set "MM_NODE=C:\Users\31506\.workbuddy\binaries\node\versions\22.22.2-3\node.exe"
+if not exist "%MM_NODE%" if exist "C:\Users\31506\node\node-v22.23.3-win-x64\node.exe" set "MM_NODE=C:\Users\31506\node\node-v22.23.3-win-x64\node.exe"
 if not defined MM_CARGO set "MM_CARGO=C:\Users\31506\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
 if not defined MM_RUSTC set "MM_RUSTC=C:\Users\31506\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe"
 if not defined RUSTUP_HOME set "RUSTUP_HOME=C:\Users\31506\.rustup"
@@ -45,22 +47,27 @@ echo.
 if not exist "%MM_NODE%" goto :err_node
 if not exist "%MM_CARGO%" goto :err_cargo
 
-echo [1/4] 前端构建 (vite build)
+echo [1/5] 前端构建 (vite build)
 call :fe_build
 if errorlevel 1 set "MM_FAIL=1"
 echo.
 
-echo [2/4] 前端类型检查 (tsc --noEmit)
+echo [2/5] 前端类型检查 (tsc --noEmit)
 call :fe_typecheck
 if errorlevel 1 set "MM_FAIL=1"
 echo.
 
-echo [3/4] Rust 单元与集成测试 (cargo test)
+echo [3/5] 前端单元测试 (vitest run)
+call :fe_test
+if errorlevel 1 set "MM_FAIL=1"
+echo.
+
+echo [4/5] Rust 单元与集成测试 (cargo test)
 call :rust_test
 if errorlevel 1 set "MM_FAIL=1"
 echo.
 
-echo [4/4] Rust 编译与链接 (cargo build)
+echo [5/5] Rust 编译与链接 (cargo build)
 call :rust_build
 if errorlevel 1 set "MM_FAIL=1"
 echo.
@@ -88,6 +95,15 @@ exit /b %MM_RC%
 :fe_typecheck
 pushd "%MM_ROOT%"
 call "%MM_NODE%" node_modules\typescript\bin\tsc --noEmit
+set "MM_RC=%ERRORLEVEL%"
+popd
+exit /b %MM_RC%
+
+rem 前端单测走 scripts/run-tests.mjs：它先把临时目录指到项目内再拉起 vitest，
+rem 直接调 vitest 会因为系统临时目录不可写而 EPERM。
+:fe_test
+pushd "%MM_ROOT%"
+call "%MM_NODE%" scripts\run-tests.mjs
 set "MM_RC=%ERRORLEVEL%"
 popd
 exit /b %MM_RC%

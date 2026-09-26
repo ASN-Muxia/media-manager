@@ -42,14 +42,15 @@ start.bat --no-build        # 跳过构建，直接启动已有 exe
 双击 verify.bat
 ```
 
-依次执行四项检查并汇总结果，全部通过时退出码为 0：
+依次执行五项检查并汇总结果，全部通过时退出码为 0：
 
 | 步骤 | 内容 |
 |---|---|
-| 1/4 | 前端构建 `vite build` |
-| 2/4 | 前端类型检查 `tsc --noEmit` |
-| 3/4 | Rust 单元与集成测试 `cargo test`（60 个） |
-| 4/4 | Rust 编译与链接 `cargo build` |
+| 1/5 | 前端构建 `vite build` |
+| 2/5 | 前端类型检查 `tsc --noEmit` |
+| 3/5 | 前端单元测试 `npm test`（Vitest） |
+| 4/5 | Rust 单元与集成测试 `cargo test`（150 个） |
+| 5/5 | Rust 编译与链接 `cargo build --features custom-protocol` |
 
 ### 路径覆盖（可选）
 
@@ -75,9 +76,11 @@ npm install
 # 前端开发服务器（配合 src-tauri 的 devUrl: http://localhost:1420）
 npm run dev
 
-# 前端构建 / 类型检查
+# 前端构建 / 类型检查 / 单元测试
 npm run build
 npm run typecheck
+npm test          # Vitest（jsdom），见 scripts/run-tests.mjs
+npm run test:watch
 
 # Rust 测试 / 编译
 cd src-tauri
@@ -87,8 +90,9 @@ cargo build --features custom-protocol
 # 只做类型/借用检查（不需要内嵌资源）
 cargo check
 
-# 一体化开发（注意：beforeDevCommand 走 npm run dev，
-# 若本机 cmd 的 PATH 查找失效，直接 cargo run 更稳）
+# 一体化开发（beforeDevCommand 已置空，dev server 用下面的脚本起，
+# 它直接调 vite 的 Node API，不依赖 cmd 的 PATH 查找）
+npm run dev:server        # 起 http://localhost:1420
 cd src-tauri && cargo run
 ```
 
@@ -98,7 +102,30 @@ cd src-tauri && cargo run
 2. 回列表即可看到封面墙（未刮削的条目右上角有红色 `?`）；
 3. 在设置里填入 TMDB API Key → 点顶部「批量刮削」，海报与简介会自动回填；
 4. 点海报进详情页：可播放、重新刮削、手动匹配 TMDB、在文件夹中显示；
-5. 剧集详情页按季列出单集（刮削后会显示缩略图、集名与播出日期）。
+5. 剧集详情页按季列出单集（刮削后会显示缩略图、集名与播出日期）；
+6. **分类与标签**：左侧「分类」区的 ＋ 可新建栏目，hover 栏目可改名 / 删除；
+   详情页里勾选分类、添加标签；顶栏有标签下拉筛选；
+7. **手动新建剧集**：顶栏「＋ 新建剧集」，与扫描归纳出来的剧集走同一套数据。
+
+## 四b、元数据源与可选的大模型增强
+
+**分工（元数据 API 是地基，AI 只是可选补漏层）：**
+
+| 数据源 | 作用 | 是否必需 |
+|---|---|---|
+| TMDb | 片名 / 简介 / 评分 / 海报（**权威**） | ✅ 必需 |
+| TheTVDB | 剧集的季 / 集结构（TMDb 缺集信息时兜底） | 可选 |
+| Fanart.tv | TMDb 缺图时补海报与背景 | 可选 |
+| OMDb | IMDb 评分（缺评分时才写入） | 可选 |
+| 大模型 | **只**解析脏文件名，产出「拿什么去检索」的字段 | 可选，默认关闭 |
+
+- 可选 provider 没填 Key 就整段跳过，不影响主链路；**关掉大模型，刮削行为与没这个模块时一致**。
+- 补漏而非覆盖：已有海报 / 评分一律不动。
+- 推荐模型：文本 `deepseek-chat`（`https://api.deepseek.com/v1`），视觉 `qwen-vl-max`；
+  都走 OpenAI 兼容协议（备选：OpenAI / Moonshot / 智谱 / 本地 Ollama），设置页可一键填入。
+- 调用失败**自动回退**到正则解析器，不会让识别结果变糟。
+- 视觉模型只在文件名**完全不可推断**（纯数字 / 纯符号）时才会被调用，后端有闸门。
+- **不得以纯 AI 刮削替代元数据 API**：标题、简介、评分、海报一律以元数据 API 为准。
 
 ## 五、常见问题
 
@@ -154,21 +181,30 @@ cargo build --features custom-protocol
 ```
 src/                      前端（Vue 3 + Pinia）
   api/commands.ts         所有 Tauri 命令封装与类型
-  stores/                 settingsStore / mediaStore
-  components/             Sidebar / PosterGrid / PosterCard / MediaDetail / SettingsPanel
+  stores/                 settingsStore / mediaStore / categoryStore
+  components/             Sidebar / PosterGrid / PosterCard / MediaDetail /
+                          SettingsPanel / CreateSeriesDialog
 src-tauri/src/            后端（Rust）
-  db.rs                   连接、建表、增量迁移
+  db.rs                   连接、建表、增量迁移（当前 v4，8 张表）
   parser.rs               文件名 -> 标题/年份/季/集/TMDB id
-  scanner.rs              目录扫描与入库（剧集按目录分组）
-  tmdb.rs                 TMDB v3 客户端
-  commands/               settings / media / scrape / play 四组命令
+  grouping.rs             剧集识别与二次校正（防误判规则都在这里）
+  scanner.rs              目录扫描与入库（L0 按目录归集 + 二次校正 + 可选 LLM 增强）
+  tmdb.rs / tvdb.rs / fanart.rs / omdb.rs   四个元数据客户端
+  http.rs                 共享 HTTP 助手（hosts 自定义解析、错误标签）
+  llm.rs                  大模型脏文件名解析（可选增强层，失败即回退）
+  commands/               settings / media / catalog / scrape / play / diag
+scripts/dev-server.mjs    不依赖 cmd PATH 的 vite dev server 启动器
+scripts/run-tests.mjs     Vitest 启动器（修 watch 模式静默降级与 EPERM）
 start.bat / verify.bat    快速启动与一键盘点
 交接状态-2026-09-25.md     详细的开发与验证记录
 ```
 
 ## 八、已知限制
 
-- 前端只有构建 + 类型检查两道验证，没有组件级单元测试；
-- 剧集分组键取「媒体根目录下的第一层目录名」，若目录结构异常会退回解析标题；
-- 目前只支持 TMDB 一个元数据源，且仅中文（`zh-CN`）；
-- 扫描是同步执行，媒体库很大时界面会等待且没有进度条。
+- 剧集分组键取「媒体根目录下的第一层目录名」，目录结构异常时退回解析标题；
+  跨媒体根目录的同一部剧不会被合并（有意为之，避免误合并）。
+- 单集级刮削只覆盖库中已有季号的季；新增季需要先重新扫描。
+- TheTVDB / Fanart.tv / OMDb 与大模型的调用结果**没有本地缓存**，重复刮削会重复请求。
+- 大模型增强层按文件逐个调用，脏文件名很多时扫描会明显变慢（默认关闭，可随时关掉）。
+- `src-tauri/target` 约 5.9 GB（debug 全量调试信息）；`[profile.dev] incremental = false`
+  是为了修 rustc ICE，对体积的改善有限。要真正瘦身请改 `[profile.dev] debug` 或用 release 构建。

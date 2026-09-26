@@ -25,7 +25,8 @@ if /i "%~1"=="--release" set "MM_PROFILE=release"
 if /i "%~1"=="--no-build" set "MM_DO_BUILD=0"
 
 rem ---- 默认路径（可用环境变量覆盖）----
-if not defined MM_NODE set "MM_NODE=C:\Users\31506\node\node-v22.23.3-win-x64\node.exe"
+if not defined MM_NODE set "MM_NODE=C:\Users\31506\.workbuddy\binaries\node\versions\22.22.2-3\node.exe"
+if not exist "%MM_NODE%" if exist "C:\Users\31506\node\node-v22.23.3-win-x64\node.exe" set "MM_NODE=C:\Users\31506\node\node-v22.23.3-win-x64\node.exe"
 if not defined MM_CARGO set "MM_CARGO=C:\Users\31506\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
 if not defined MM_RUSTC set "MM_RUSTC=C:\Users\31506\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe"
 if not defined RUSTUP_HOME set "RUSTUP_HOME=C:\Users\31506\.rustup"

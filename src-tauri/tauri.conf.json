@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.example.media-manager",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "",
     "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"

@@ -23,6 +23,13 @@ tauri-build = { version = "2", features = [] }
 custom-protocol = ["tauri/custom-protocol"]
 
 [profile.dev]
+# 只保留行号级别的调试信息（默认 debug=2 会把完整 DWARF 写进每个 .rlib/.exe）。
+#
+# 原因：默认设置下 target/ 实测约 4.5 GB，几乎全是调试信息；
+# debug=1 只留函数名与行号——panic 时仍能看到出错位置，日常排障够用，
+# 体积则大幅下降。需要完整调试信息时临时注释掉这两行或改用 `debug = 2`。
+debug = 1
+
 # 关闭增量编译。
 #
 # 原因：本机增量缓存多次损坏（日志里反复出现

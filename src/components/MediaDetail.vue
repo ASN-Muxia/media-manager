@@ -1,11 +1,59 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import {
-  imageUrl, searchTmdb, tmdbTitle, tmdbYear, type Episode, type TmdbSearchItem,
+  getMediaCategories, getMediaTags, imageUrl, searchTmdb, setMediaCategories,
+  setMediaTags, tmdbTitle, tmdbYear, tvdbApply,
+  type Category, type Episode, type MediaItem, type Tag, type TmdbSearchItem,
 } from "../api/commands";
 import { useMediaStore } from "../stores/mediaStore";
+import { useCategoryStore } from "../stores/categoryStore";
 
 const store = useMediaStore();
+const catStore = useCategoryStore();
+
+/** 「编辑信息」上抛给 App，由它打开编辑对话框（新建 / 编辑共用一个弹窗）。 */
+const emit = defineEmits<{ (e: "edit", item: MediaItem): void }>();
+
+/* ---------------- 单集（聚合剧目下的资源）管理 ---------------- */
+/* 只针对当前这一条剧目：删掉的单集不会影响其他剧目，剧目主记录本身也保留。 */
+
+const epSelected = ref<number[]>([]);
+
+function isEpSelected(id: number): boolean {
+  return epSelected.value.includes(id);
+}
+
+function toggleEp(id: number): void {
+  const i = epSelected.value.indexOf(id);
+  if (i >= 0) epSelected.value.splice(i, 1);
+  else epSelected.value.push(id);
+}
+
+function toggleEpAll(): void {
+  const all = (detail.value?.episodes ?? []).map((e) => e.id);
+  epSelected.value =
+    epSelected.value.length >= all.length && all.every(isEpSelected) ? [] : all;
+}
+
+/**
+ * 删除单集（单条或批量都走这里）。
+ *
+ * 二次确认里必须说清楚：删的是库里的单集记录，本地文件不动；
+ * 剧目主记录保留（删光了也还是一条「空剧目」，方便以后重新导入）。
+ */
+async function removeEpisodes(ids: number[]): Promise<void> {
+  const d = detail.value;
+  if (!d || !ids.length) return;
+  const n = ids.length;
+  const ok = window.confirm(
+    n === 1
+      ? "确定删除这条资源？\n\n删除后不可恢复；本地视频文件不会被删除。"
+      : `确定删除选中的 ${n} 条资源？\n\n删除后不可恢复；本地视频文件不会被删除。`,
+  );
+  if (!ok) return;
+  await store.removeEpisodes(d.media.id, [...ids]);
+  epSelected.value = [];
+}
 
 /** 刮削过的用 TMDB 集名，未刮削的退回文件名（更可读）。 */
 function epTitle(e: Episode): string {
@@ -21,6 +69,17 @@ const backdrop = computed(() => imageUrl(detail.value?.media.backdrop_path, "w12
 const score = computed(() =>
   detail.value?.media.vote_average ? detail.value.media.vote_average.toFixed(1) : null,
 );
+/** 类型标签：`unknown` 是「判定不出来」，不能显示成电影。 */
+const typeLabel = computed(() => {
+  const t = detail.value?.media.type;
+  return t === "tv" ? "剧集" : t === "unknown" ? "待确认" : "电影";
+});
+const typeIcon = computed(() => {
+  const t = detail.value?.media.type;
+  return t === "tv" ? "📺" : t === "unknown" ? "❓" : "🎬";
+});
+/** 单文件条目（电影，以及还没定型的「待确认」）都能直接播放。 */
+const isSingleFile = computed(() => detail.value?.media.type !== "tv");
 
 /** 单集按季分组。 */
 const seasons = computed(() => {
@@ -50,8 +109,115 @@ watch(
     results.value = [];
     q.value = "";
     matchMsg.value = "";
+    tagInput.value = "";
+    catMsg.value = "";
+    // 换条目时清空单集勾选：上一个剧目的 id 不能带到下一个剧目
+    epSelected.value = [];
+    void loadClassification();
   },
+  { immediate: true },
 );
+
+/* ---------------- 分类与标签 ---------------- */
+/* 一条影视可以属于多个分类（多对多），也可以有多个标签。
+   分类改动会立刻反映到左侧导航，标签则用于筛选。 */
+
+const allCategories = computed(() => catStore.categories);
+const myCategories = ref<Category[]>([]);
+const myTags = ref<Tag[]>([]);
+const tagInput = ref("");
+const catMsg = ref("");
+const tvdbBusy = ref(false);
+
+async function loadClassification(): Promise<void> {
+  const id = store.selectedId;
+  if (!id) return;
+  if (!catStore.categories.length) await catStore.load();
+  try {
+    const [c, t] = await Promise.all([getMediaCategories(id), getMediaTags(id)]);
+    myCategories.value = c;
+    myTags.value = t;
+  } catch {
+    myCategories.value = [];
+    myTags.value = [];
+  }
+}
+
+function hasCategory(id: number): boolean {
+  return myCategories.value.some((c) => c.id === id);
+}
+
+/** 勾选 / 取消一个分类（全量覆盖式写回，后端保证幂等）。 */
+async function toggleCategory(id: number): Promise<void> {
+  const id2 = store.selectedId;
+  if (!id2) return;
+  const next = hasCategory(id)
+    ? myCategories.value.filter((c) => c.id !== id).map((c) => c.id)
+    : [...myCategories.value.map((c) => c.id), id];
+  try {
+    myCategories.value = await setMediaCategories(id2, next);
+    await catStore.loadCategories();
+  } catch (e) {
+    catMsg.value = "更新分类失败：" + String(e);
+  }
+}
+
+function parseTagInput(): string[] {
+  return tagInput.value
+    .split(/[,，、\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+async function addTags(): Promise<void> {
+  const id = store.selectedId;
+  const names = parseTagInput();
+  if (!id || !names.length) return;
+  const merged = [...new Set([...myTags.value.map((t) => t.name), ...names])];
+  try {
+    myTags.value = await setMediaTags(id, merged);
+    tagInput.value = "";
+    await catStore.loadTags();
+  } catch (e) {
+    catMsg.value = "更新标签失败：" + String(e);
+  }
+}
+
+async function dropTag(name: string): Promise<void> {
+  const id = store.selectedId;
+  if (!id) return;
+  try {
+    myTags.value = await setMediaTags(
+      id,
+      myTags.value.map((t) => t.name).filter((n) => n !== name),
+    );
+    await catStore.loadTags();
+  } catch (e) {
+    catMsg.value = "更新标签失败：" + String(e);
+  }
+}
+
+/**
+ * 手动套用 TheTVDB 的季 / 集结构。
+ *
+ * 只在 TMDb 缺集信息（或集顺序跟 TMDb 不一致）时才需要——它是**补结构的**，
+ * 不是刮削的替代品，片名 / 简介 / 评分仍然以 TMDb 为准。
+ */
+async function applyTvdb(): Promise<void> {
+  const id = store.selectedId;
+  if (!id) return;
+  tvdbBusy.value = true;
+  catMsg.value = "";
+  try {
+    const r = await tvdbApply(id);
+    catMsg.value = `已应用 TheTVDB #${r.tvdbId}，回填 ${r.episodes} 集`;
+    await store.openDetail(id);
+  } catch (e) {
+    catMsg.value = "TheTVDB 应用失败：" + String(e);
+  } finally {
+    tvdbBusy.value = false;
+  }
+}
 
 async function doSearch(): Promise<void> {
   const d = detail.value;
@@ -87,11 +253,11 @@ function pick(it: TmdbSearchItem): void {
       <div class="shade"></div>
       <div class="head-inner">
         <img v-if="poster" class="poster" :src="poster" :alt="detail.media.display_title" />
-        <div v-else class="poster ph">{{ detail.media.type === "tv" ? "📺" : "🎬" }}</div>
+        <div v-else class="poster ph">{{ typeIcon }}</div>
         <div class="info">
           <h2>{{ detail.media.display_title }}</h2>
           <p class="line">
-            <span class="tag">{{ detail.media.type === "tv" ? "剧集" : "电影" }}</span>
+            <span class="tag">{{ typeLabel }}</span>
             <span v-if="detail.media.year">{{ detail.media.year }}</span>
             <span v-if="detail.media.genre">{{ detail.media.genre }}</span>
             <span v-if="score" class="score">★ {{ score }}</span>
@@ -107,14 +273,24 @@ function pick(it: TmdbSearchItem): void {
 
     <div class="actions">
       <button
-        v-if="detail.media.type === 'movie'"
+        v-if="isSingleFile"
         class="btn primary"
         @click="store.play(detail.media.file_path)"
       >▶ 播放</button>
       <button class="btn" @click="store.scrape(detail.media.id)">
         {{ detail.media.tmdb_id ? "重新刮削" : "刮削元数据" }}
       </button>
+      <button class="btn" title="修改名称 / 类型 / 年份 / 流派 / 简介" @click="emit('edit', detail.media)">
+        ✎ 编辑信息
+      </button>
       <button class="btn" @click="showMatch = !showMatch">手动匹配 TMDB</button>
+      <button
+        v-if="detail.media.type === 'tv'"
+        class="btn ghost"
+        :disabled="tvdbBusy"
+        title="TMDb 缺集信息或集顺序不一致时，用 TheTVDB 的季/集结构补"
+        @click="applyTvdb"
+      >{{ tvdbBusy ? "应用中…" : "套用 TheTVDB 结构" }}</button>
       <button
         v-if="detail.media.file_path"
         class="btn ghost"
@@ -122,6 +298,46 @@ function pick(it: TmdbSearchItem): void {
       >在文件夹中显示</button>
       <button class="btn danger" @click="store.remove(detail.media.id)">从库中移除</button>
     </div>
+
+    <!-- 归类与打标签：分类同时决定它在左侧导航里出现在哪个栏目下 -->
+    <section class="classify">
+      <div class="c-block">
+        <h3>分类</h3>
+        <div class="chips">
+          <button
+            v-for="c in allCategories"
+            :key="c.id"
+            class="chip"
+            :class="{ on: hasCategory(c.id) }"
+            :title="c.kind === 'manual' ? '手动创建' : '自动识别（' + c.origin + '）'"
+            @click="toggleCategory(c.id)"
+          >{{ c.name }}</button>
+          <span v-if="!allCategories.length" class="hint">
+            还没有分类，可到左侧导航「＋」新建
+          </span>
+        </div>
+      </div>
+
+      <div class="c-block">
+        <h3>标签</h3>
+        <div class="tag-row">
+          <span v-for="t in myTags" :key="t.id" class="tag-chip">
+            {{ t.name }}
+            <button class="x" title="移除标签" @click="dropTag(t.name)">✕</button>
+          </span>
+          <input
+            v-model="tagInput"
+            class="tag-input"
+            placeholder="添加标签，逗号或空格分隔"
+            @keyup.enter="addTags"
+          />
+          <button class="btn small" :disabled="!parseTagInput().length" @click="addTags">
+            添加
+          </button>
+        </div>
+      </div>
+      <p v-if="catMsg" class="match-msg">{{ catMsg }}</p>
+    </section>
 
     <section v-if="showMatch" class="match">
       <div class="match-row">
@@ -156,10 +372,35 @@ function pick(it: TmdbSearchItem): void {
     </section>
 
     <section v-if="seasons.length" class="episodes">
+      <div class="ep-bar">
+        <span class="ep-count">
+          共 {{ detail.media.episode_count }} 条资源<template v-if="epSelected.length">
+            · 已选 {{ epSelected.length }}
+          </template>
+        </span>
+        <button class="btn small ghost" @click="toggleEpAll">
+          {{ epSelected.length >= detail.media.episode_count ? "取消全选" : "全选" }}
+        </button>
+        <button
+          class="btn small danger"
+          :disabled="!epSelected.length"
+          @click="removeEpisodes(epSelected)"
+        >
+          删除所选
+        </button>
+      </div>
+
       <div v-for="s in seasons" :key="s.season" class="season">
         <h3>第 {{ s.season }} 季</h3>
         <ul>
-          <li v-for="e in s.list" :key="e.id">
+          <li v-for="e in s.list" :key="e.id" :class="{ picked: isEpSelected(e.id) }">
+            <label class="ep-check">
+              <input
+                type="checkbox"
+                :checked="isEpSelected(e.id)"
+                @change="toggleEp(e.id)"
+              />
+            </label>
             <img
               v-if="imageUrl(e.still_path, 'w92')"
               class="ep-thumb"
@@ -173,12 +414,17 @@ function pick(it: TmdbSearchItem): void {
             </span>
             <button class="btn small" @click="store.play(e.file_path)">▶ 播放</button>
             <button class="btn small ghost" @click="store.reveal(e.file_path)">目录</button>
+            <button
+              class="btn small danger"
+              title="删除这一条资源"
+              @click="removeEpisodes([e.id])"
+            >✕</button>
           </li>
         </ul>
       </div>
     </section>
     <section v-else-if="detail.media.type === 'tv'" class="episodes empty">
-      暂无单集记录，请先扫描媒体库。
+      暂无单集记录，请先扫描媒体库，或用顶部的「导入文件夹」添加。
     </section>
   </article>
 </template>
@@ -225,6 +471,51 @@ h2 { margin: 0; font-size: var(--fs-24); line-height: 1.25; }
 .r-title { font-size: var(--fs-14); font-weight: 550; }
 .r-sub { display: flex; gap: 10px; font-size: var(--fs-12); color: var(--muted); }
 .r-id { opacity: .65; }
+
+.classify {
+  display: flex; flex-direction: column; gap: calc(var(--space) * 4);
+  padding: calc(var(--space) * 4); border-radius: var(--radius);
+  background: var(--surface); border: 1px solid var(--border);
+}
+.c-block { display: flex; flex-direction: column; gap: 8px; }
+.classify h3 { margin: 0; font-size: var(--fs-13); color: var(--muted); font-weight: 600; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  padding: 5px 11px; border-radius: 999px; cursor: pointer; font-size: var(--fs-12);
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--muted);
+  transition: background .15s ease, color .15s ease;
+}
+.chip:hover { color: var(--text); }
+.chip.on { background: var(--accent); color: #fff; border-color: transparent; }
+.hint { font-size: var(--fs-12); color: var(--muted); }
+.tag-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.tag-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px;
+  border-radius: var(--radius-s); font-size: var(--fs-12);
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2);
+}
+.tag-chip .x {
+  border: 0; background: none; color: var(--muted); cursor: pointer; font-size: var(--fs-11);
+  padding: 0 2px;
+}
+.tag-chip .x:hover { color: var(--danger); }
+.tag-input {
+  flex: 1; min-width: 180px; padding: 6px 10px; border-radius: var(--radius-s);
+  font-size: var(--fs-12); border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text); outline: none;
+}
+.tag-input:focus { border-color: var(--accent); }
+
+/* 单集工具条：勾选 / 全选 / 批量删除 */
+.ep-bar {
+  display: flex; align-items: center; gap: 10px; padding: calc(var(--space) * 2) calc(var(--space) * 3);
+  border-radius: var(--radius-s); background: var(--surface); border: 1px solid var(--border);
+}
+.ep-count { flex: 1; font-size: var(--fs-13); color: var(--text-2); }
+.ep-check { flex: none; display: flex; align-items: center; }
+.ep-check input { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+/* 勾上的行给个底纹，避免看不出选了哪些 */
+.season li.picked { background: var(--accent-soft); }
 
 .episodes { display: flex; flex-direction: column; gap: calc(var(--space) * 5); }
 .episodes.empty { color: var(--muted); font-size: var(--fs-13); }

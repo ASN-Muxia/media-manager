@@ -6,9 +6,135 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::io;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 const API_BASE: &str = "https://api.themoviedb.org/3";
+
+/// 元数据语言默认值（设置项为空时用它）。
+pub const DEFAULT_LANGUAGE: &str = "zh-CN";
+
+/// 默认端口（netloc 不带端口时用它）。本项目只走 HTTPS。
+const DEFAULT_PORT: u16 = 443;
+
+/// 拆分 `host:port` / `[::1]:443` / `host` 形式的 netloc。
+fn split_netloc(netloc: &str) -> (String, u16) {
+    if let Some(rest) = netloc.strip_prefix('[') {
+        // IPv6 字面量：`[::1]:443`
+        let (host, port_str) = match rest.split_once(']') {
+            Some((h, tail)) => (h, tail.strip_prefix(':').unwrap_or("")),
+            None => (rest, ""),
+        };
+        return (
+            host.to_string(),
+            port_str.parse::<u16>().unwrap_or(DEFAULT_PORT),
+        );
+    }
+    match netloc.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (
+            h.to_string(),
+            p.parse::<u16>().unwrap_or(DEFAULT_PORT),
+        ),
+        _ => (netloc.to_string(), DEFAULT_PORT),
+    }
+}
+
+/// 解析一行 hosts 配置，返回若干 `(域名, IP)` 映射。
+///
+/// 兼容两种写法（顺序自动识别，与系统 hosts 文件一致时写「IP 域名」）：
+/// - `13.224.161.90 api.themoviedb.org`
+/// - `api.themoviedb.org 13.224.161.90`
+/// - 一行可写多个域名：`1.2.3.4 a.com b.com`
+/// `#` 之后视为注释；无法识别的行直接忽略。
+pub fn parse_hosts_line(line: &str) -> Vec<(String, String)> {
+    let body = line.split('#').next().unwrap_or("").trim();
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return Vec::new();
+    }
+    let first_is_ip = tokens[0].parse::<IpAddr>().is_ok();
+    let last_is_ip = tokens[tokens.len() - 1].parse::<IpAddr>().is_ok();
+    let (ip, hosts) = if first_is_ip {
+        (tokens[0].to_string(), &tokens[1..])
+    } else if last_is_ip {
+        (
+            tokens[tokens.len() - 1].to_string(),
+            &tokens[..tokens.len() - 1],
+        )
+    } else {
+        return Vec::new(); // 既没有可识别的 IP，忽略
+    };
+    hosts
+        .iter()
+        .map(|h| (normalize_host(h), ip.clone()))
+        .collect()
+}
+
+/// 域名归一：去尾部点 + 转小写。
+fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_end_matches('.')
+        .trim_start_matches("*.")
+        .to_ascii_lowercase()
+}
+
+/// 自定义域名 → IP 映射（等价一个只作用于本进程的小型 hosts 文件）。
+///
+/// 之所以做成 `ureq::Resolver` 而不是「把 URL 里的域名换成 IP」：
+/// 后者会破坏 HTTPS 的 SNI 与证书校验（证书签的是域名，不是 IP）。
+/// 只改解析结果、保留原 URL，TLS 握手与 `Host` 头都不受影响。
+#[derive(Debug, Default, Clone)]
+pub struct HostsResolver {
+    map: HashMap<String, IpAddr>,
+}
+
+impl HostsResolver {
+    /// 按行构造；重复域名以**后出现的为准**（便于后面的配置覆盖前面的）。
+    pub fn from_lines(lines: &[String]) -> Self {
+        let mut map = HashMap::new();
+        for line in lines {
+            for (host, ip) in parse_hosts_line(line) {
+                if host.is_empty() {
+                    continue;
+                }
+                if let Ok(addr) = ip.parse::<IpAddr>() {
+                    map.insert(host, addr);
+                }
+            }
+        }
+        Self { map }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// 命中自定义映射时返回映射后的地址，否则走系统 DNS。
+    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+        let (host, port) = split_netloc(netloc);
+        if let Some(ip) = self.map.get(&host) {
+            return Ok(vec![SocketAddr::new(*ip, port)]);
+        }
+        netloc.to_socket_addrs().map(|it| it.collect())
+    }
+}
+
+impl ureq::Resolver for HostsResolver {
+    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+        HostsResolver::resolve(self, netloc)
+    }
+}
 
 /// 把字符串做百分号编码（避免引入额外依赖）。
 pub fn urlencode(s: &str) -> String {
@@ -164,17 +290,46 @@ struct SeasonResponse {
 pub struct TmdbClient {
     agent: ureq::Agent,
     api_key: String,
+    /// 元数据语言（`language` 参数）。留空会回落 `DEFAULT_LANGUAGE`。
+    language: String,
 }
 
 impl TmdbClient {
+    /// 不带自定义 hosts（仅走系统 DNS）。
+    #[allow(dead_code)]
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_hosts(api_key, &[])
+    }
+
+    /// 带自定义域名解析。`hosts` 为 hosts 文件格式的若干行（见 `parse_hosts_line`）。
+    pub fn with_hosts(api_key: impl Into<String>, hosts: &[String]) -> Self {
+        Self::with_hosts_and_language(api_key, hosts, DEFAULT_LANGUAGE)
+    }
+
+    /// 带自定义域名解析 + 指定语言（设置项 `tmdbLanguage`）。
+    pub fn with_hosts_and_language(
+        api_key: impl Into<String>,
+        hosts: &[String],
+        language: &str,
+    ) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(20))
             .user_agent("media-manager/0.1 (+tauri)")
+            .resolver(HostsResolver::from_lines(hosts))
             .build();
         Self {
             agent,
             api_key: api_key.into(),
+            language: language.to_string(),
+        }
+    }
+
+    /// 实际使用的语言：设置项为空时回落默认值。
+    fn language(&self) -> &str {
+        if self.language.trim().is_empty() {
+            DEFAULT_LANGUAGE
+        } else {
+            self.language.trim()
         }
     }
 
@@ -216,7 +371,7 @@ impl TmdbClient {
         };
         let mut q: Vec<(&str, String)> = vec![
             ("query", query.to_string()),
-            ("language", "zh-CN".to_string()),
+            ("language", self.language().to_string()),
             ("include_adult", "false".to_string()),
         ];
         if let Some(y) = year {
@@ -233,14 +388,14 @@ impl TmdbClient {
         } else {
             format!("/movie/{id}")
         };
-        let raw: Value = self.get_json(&path, &[("language", "zh-CN".to_string())])?;
+        let raw: Value = self.get_json(&path, &[("language", self.language().to_string())])?;
         Ok(TmdbMeta::from_value(id, kind, &raw))
     }
 
     /// 取某一季的单集列表（单集级刮削用）。
     pub fn season_episodes(&self, tv_id: i64, season: i64) -> Result<Vec<TmdbEpisodeItem>, String> {
         let path = format!("/tv/{tv_id}/season/{season}");
-        let resp: SeasonResponse = self.get_json(&path, &[("language", "zh-CN".to_string())])?;
+        let resp: SeasonResponse = self.get_json(&path, &[("language", self.language().to_string())])?;
         Ok(resp.episodes)
     }
 }
@@ -368,5 +523,93 @@ mod tests {
     fn season_response_tolerates_missing_episodes_key() {
         let resp: SeasonResponse = serde_json::from_str(r#"{"season_number":1}"#).unwrap();
         assert!(resp.episodes.is_empty());
+    }
+
+    #[test]
+    fn split_netloc_handles_host_port_ipv6_and_bare_host() {
+        assert_eq!(split_netloc("api.themoviedb.org:443"), ("api.themoviedb.org".to_string(), 443));
+        assert_eq!(split_netloc("example.com"), ("example.com".to_string(), 443));
+        assert_eq!(split_netloc("[::1]:8080"), ("::1".to_string(), 8080));
+    }
+
+    #[test]
+    fn parse_hosts_line_supports_ip_first_and_host_first() {
+        let a = parse_hosts_line("13.224.161.90 api.themoviedb.org");
+        assert_eq!(a, vec![("api.themoviedb.org".to_string(), "13.224.161.90".to_string())]);
+
+        let b = parse_hosts_line("image.tmdb.org  104.16.61.155");
+        assert_eq!(b, vec![("image.tmdb.org".to_string(), "104.16.61.155".to_string())]);
+    }
+
+    #[test]
+    fn parse_hosts_line_supports_multiple_hosts_comments_and_junk() {
+        let many = parse_hosts_line("1.2.3.4 a.com b.com");
+        assert_eq!(many.len(), 2);
+        assert_eq!(many[0].0, "a.com");
+        assert_eq!(many[1].0, "b.com");
+
+        assert!(parse_hosts_line("# 整行注释").is_empty());
+        assert!(parse_hosts_line("").is_empty());
+        assert!(parse_hosts_line("只有一个词").is_empty());
+        assert!(parse_hosts_line("不是IP 也不是IP").is_empty());
+
+        // 行尾注释要被剥掉
+        let c = parse_hosts_line("5.6.7.8 c.com # 备注");
+        assert_eq!(c, vec![("c.com".to_string(), "5.6.7.8".to_string())]);
+    }
+
+    #[test]
+    fn hosts_resolver_overrides_mapped_host_and_keeps_port() {
+        let r = HostsResolver::from_lines(&[
+            "13.224.161.90 api.themoviedb.org".to_string(),
+            "127.0.0.1 localhost".to_string(),
+        ]);
+        assert_eq!(r.len(), 2);
+
+        let got = HostsResolver::resolve(&r, "api.themoviedb.org:443").unwrap();
+        assert_eq!(got, vec!["13.224.161.90:443".parse::<SocketAddr>().unwrap()]);
+
+        // 未配置的域名仍走系统解析（localhost 必然能解析）
+        let other = HostsResolver::resolve(&r, "localhost:12345").unwrap();
+        assert!(other.iter().any(|a| a.ip().is_loopback()));
+    }
+
+    #[test]
+    fn hosts_resolver_ignores_bad_ip_and_later_line_wins() {
+        let r = HostsResolver::from_lines(&[
+            "999.999.999.999 nope.com".to_string(),
+            "1.1.1.1 dup.com".to_string(),
+            "2.2.2.2 dup.com".to_string(),
+        ]);
+        assert_eq!(r.len(), 1, "非法 IP 应被丢弃，重复域名以后出现的为准");
+        let got = HostsResolver::resolve(&r, "dup.com:443").unwrap();
+        assert_eq!(got, vec!["2.2.2.2:443".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn client_language_falls_back_to_default_when_blank() {
+        assert_eq!(
+            TmdbClient::with_hosts_and_language("k", &[], "").language(),
+            DEFAULT_LANGUAGE
+        );
+        assert_eq!(
+            TmdbClient::with_hosts_and_language("k", &[], "  ").language(),
+            DEFAULT_LANGUAGE,
+            "全空白应回落默认语言"
+        );
+        assert_eq!(
+            TmdbClient::with_hosts_and_language("k", &[], " en-US ").language(),
+            "en-US",
+            "首尾空格应被去掉"
+        );
+        assert_eq!(TmdbClient::with_hosts("k", &[]).language(), DEFAULT_LANGUAGE);
+    }
+
+    #[test]
+    fn hosts_resolver_empty_falls_back_to_system_dns() {
+        let r = HostsResolver::from_lines(&[]);
+        assert!(r.is_empty());
+        let got = HostsResolver::resolve(&r, "localhost:443").unwrap();
+        assert!(!got.is_empty());
     }
 }

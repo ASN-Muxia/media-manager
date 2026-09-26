@@ -5,18 +5,24 @@
  */
 import { onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { dbInfo, detectPlayer, openDataDir, readReadyMarker, runtimeInfo } from "../api/commands";
+import {
+  dbInfo, detectPlayer, llmParseName, llmPresets, omdbLookup, openDataDir,
+  readReadyMarker, runtimeInfo, tmdbTest, type LlmPreset,
+} from "../api/commands";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useMediaStore } from "../stores/mediaStore";
+import { useCategoryStore } from "../stores/categoryStore";
 
 const store = useSettingsStore();
 const media = useMediaStore();
+const catalog = useCategoryStore();
 
 const newDir = ref("");
 const status = ref("");
 const tables = ref<string[]>([]);
 const player = ref<string | null>(null);
 const probing = ref(false);
+const testing = ref(false);
 const schemaVersion = ref<number | null>(null);
 const dbPath = ref("");
 const pageUrl = ref("");
@@ -29,6 +35,7 @@ function fmtTime(ts: number | null): string {
 onMounted(async () => {
   if (!store.loaded) await store.load();
   await media.loadHistory();
+  void catalog.load();
   try {
     tables.value = (await dbInfo()).tables;
   } catch {
@@ -98,6 +105,20 @@ async function onSave(): Promise<void> {
   }
 }
 
+/** 用当前填写的 hosts 试连一次 TMDB，验证配置是否真的生效。 */
+async function onTestConnection(): Promise<void> {
+  testing.value = true;
+  try {
+    // 先落库再测，避免测的是「没保存的旧配置」。
+    await store.save();
+    status.value = "✅ " + (await tmdbTest());
+  } catch (e) {
+    status.value = "❌ 连接失败：" + String(e);
+  } finally {
+    testing.value = false;
+  }
+}
+
 async function onReload(): Promise<void> {
   status.value = "";
   await store.load();
@@ -115,12 +136,84 @@ async function probePlayer(): Promise<void> {
   }
 }
 
+/* ---------------- 可选 provider 与大模型增强 ---------------- */
+
+const presets = ref<LlmPreset[]>([]);
+/** 「试解析」的输入与输出（直接看到模型把脏文件名翻成了什么）。 */
+const probeName = ref("");
+const probeResult = ref<string>("");
+const probingLlm = ref(false);
+const omdbTitle = ref("");
+const omdbResult = ref("");
+
+onMounted(async () => {
+  try {
+    presets.value = await llmPresets();
+  } catch {
+    presets.value = [];
+  }
+});
+
+function onPreset(): void {
+  const label = presetLabel.value;
+  const p = presets.value.find((x) => x.label === label);
+  if (p) store.applyLlmPreset(p);
+}
+
+const presetLabel = ref("");
+
+/** 手动试一次脏文件名解析：验证配置是否真的通，也看看模型认得准不准。 */
+async function onLlmProbe(): Promise<void> {
+  probeResult.value = "";
+  if (!probeName.value.trim()) {
+    probeResult.value = "请先填一个文件名";
+    return;
+  }
+  probingLlm.value = true;
+  try {
+    await store.save();
+    const f = await llmParseName(probeName.value.trim());
+    probeResult.value =
+      `片名：${f.title || "（未识别）"}｜年份：${f.year ?? "-"}｜` +
+      `季：${f.season ?? "-"}｜集：${f.episode ?? "-"}｜` +
+      `分辨率：${f.resolution ?? "-"}｜来源：${f.releaseSource ?? "-"}`;
+  } catch (e) {
+    probeResult.value = "❌ " + String(e);
+  } finally {
+    probingLlm.value = false;
+  }
+}
+
+/** 试一次 OMDb，确认 Key 有效。 */
+async function onOmdbProbe(): Promise<void> {
+  omdbResult.value = "";
+  if (!omdbTitle.value.trim()) return;
+  try {
+    const r = await omdbLookup(omdbTitle.value.trim());
+    omdbResult.value = r.rating
+      ? `《${r.title}》IMDb ${r.rating.toFixed(1)}（${r.year}）`
+      : `《${r.title}》无 IMDb 评分`;
+  } catch (e) {
+    omdbResult.value = "❌ " + String(e);
+  }
+}
+
+/** 把已有条目的 TMDB 类型一次性补成分类（老数据迁移用）。 */
+async function onSyncCategories(): Promise<void> {
+  status.value = "";
+  const r = await catalog.syncFromTmdb();
+  status.value = r
+    ? `✅ ${catalog.notice}`
+    : "❌ " + (catalog.error ?? "同步失败");
+}
+
 /** 先保存设置再扫描，避免用了旧目录。 */
 async function onScan(): Promise<void> {
   status.value = "";
   await onSave();
+  // 扫描在后台线程跑，命令立即返回；结果由 scan-progress 事件回传后写进 toast。
   await media.scan();
-  status.value = media.toast;
+  status.value = media.toast || "扫描已开始…";
 }
 
 async function onClear(): Promise<void> {
@@ -150,6 +243,143 @@ async function onOpenDataDir(): Promise<void> {
         <label>TMDB API Key</label>
         <input v-model="store.tmdbKey" type="password" placeholder="粘贴 TMDB v3 API Key" />
         <p class="panel-hint">不填也能用，只是没有海报与简介。可在设置后回列表点「批量刮削」。</p>
+      </div>
+      <div class="field">
+        <label>元数据语言</label>
+        <select v-model="store.tmdbLanguage" class="select">
+          <option v-for="o in store.languageOptions" :key="o.value" :value="o.value">
+            {{ o.label }}（{{ o.value }}）
+          </option>
+        </select>
+        <p class="panel-hint">
+          决定刮削回来的标题、简介与类型名的语言（TMDB 的 <code>language</code> 参数）。
+          改完后需重新刮削已有条目才会更新。
+        </p>
+      </div>
+      <p class="panel-hint split">
+        <strong>数据源分工</strong>：TMDb 负责片名 / 简介 / 评分 / 图（权威）；
+        TheTVDB 负责剧集的季 / 集结构；Fanart.tv 在 TMDb 缺图时补海报与背景；
+        OMDb 只补 IMDb 评分。下面三项都是<strong>可选</strong>的，留空就整段跳过，
+        不影响主链路。
+      </p>
+      <div class="field">
+        <label>TheTVDB API Key（可选 · 剧集季 / 集结构）</label>
+        <input v-model="store.tvdbKey" type="password" placeholder="用于补 TMDb 缺失的单集结构" />
+      </div>
+      <div class="field">
+        <label>Fanart.tv API Key（可选 · 补充海报 / 背景）</label>
+        <input v-model="store.fanartKey" type="password" placeholder="TMDb 没给图时才去取" />
+      </div>
+      <div class="field">
+        <label>OMDb API Key（可选 · IMDb 评分补充）</label>
+        <div class="add">
+          <input v-model="store.omdbKey" type="password" placeholder="omdbapi.com 的 Key" />
+          <input v-model="omdbTitle" class="narrow" placeholder="片名" @keyup.enter="onOmdbProbe" />
+          <button class="mini" @click="onOmdbProbe">测试</button>
+        </div>
+        <p v-if="omdbResult" class="panel-hint">{{ omdbResult }}</p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">
+        大模型脏文件名解析
+        <span class="badge">可选增强层</span>
+      </h3>
+      <p class="panel-hint split">
+        默认<strong>关闭</strong>。开启后，只有在正则解析器认不出片名
+        （标题为空、只有一两个字符、或整个文件名原样搬过来）时才会调用它，
+        用来产出「拿什么去检索」的结构化字段；<strong>真正的标题、简介、评分、海报
+        依然全部来自上面的元数据 API</strong>。调用失败会自动回退到正则结果，不会让情况变糟。
+        视觉模型只在文件名<strong>完全不可推断</strong>（纯数字 / 纯符号）时才可能用到。
+      </p>
+      <div class="field">
+        <label class="switch">
+          <input v-model="store.llmEnabled" type="checkbox" />
+          <span>启用大模型解析</span>
+        </label>
+      </div>
+      <div class="field">
+        <label>接入预设</label>
+        <div class="add">
+          <select v-model="presetLabel" class="select" @change="onPreset">
+            <option value="">— 选择一项以自动填入 —</option>
+            <option v-for="p in presets" :key="p.label" :value="p.label">{{ p.label }}</option>
+          </select>
+        </div>
+        <p class="panel-hint">都走 OpenAI 兼容协议，换地址与模型名即可切换到别的厂商（含本地 Ollama）。</p>
+      </div>
+      <div class="field">
+        <label>接口地址（OpenAI 兼容）</label>
+        <input v-model="store.llmBaseUrl" placeholder="https://api.deepseek.com/v1" />
+      </div>
+      <div class="field">
+        <label>API Key（本地 Ollama / vLLM 可留空）</label>
+        <input v-model="store.llmApiKey" type="password" />
+      </div>
+      <div class="field">
+        <label>文本模型</label>
+        <input v-model="store.llmModel" placeholder="留空则用推荐模型 deepseek-chat" />
+      </div>
+      <div class="field">
+        <label>视觉模型（只在文件名完全不可推断时用）</label>
+        <input v-model="store.llmVisionModel" placeholder="留空表示不启用视觉兜底" />
+      </div>
+      <div class="field">
+        <label>视觉模型接口地址（与文本不同源时才填）</label>
+        <input v-model="store.llmVisionBaseUrl" placeholder="留空则与文本模型同址" />
+      </div>
+      <div class="field">
+        <label>试解析一个文件名</label>
+        <div class="add">
+          <input v-model="probeName" placeholder="例如 [0724].mkv" @keyup.enter="onLlmProbe" />
+          <button class="mini" :disabled="probingLlm" @click="onLlmProbe">
+            {{ probingLlm ? "解析中…" : "保存并解析" }}
+          </button>
+        </div>
+        <p v-if="probeResult" class="panel-hint">{{ probeResult }}</p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">分类维护</h3>
+      <p class="panel-hint split">
+        左侧栏目的分类全部存在数据库里，手动建的在设置页之外（左侧导航「＋」）操作。
+        这里只做一件事：把已刮削条目的 TMDB 类型一次性补成分类——
+        <strong>升级前刮过的老数据</strong>没有分类关联，靠它补齐。
+      </p>
+      <div class="toolbar">
+        <button class="btn btn-ghost" :disabled="catalog.saving" @click="onSyncCategories">
+          {{ catalog.saving ? "同步中…" : "从 TMDB 类型同步分类" }}
+        </button>
+        <span v-if="catalog.categories.length" class="panel-hint">
+          当前 {{ catalog.categories.length }} 个分类 · {{ catalog.tags.length }} 个标签
+        </span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">Hosts 解析（自定义域名 → IP）</h3>
+      <div class="field">
+        <textarea
+          v-model="store.hostsText"
+          class="hosts"
+          rows="4"
+          spellcheck="false"
+          placeholder="13.224.161.90 api.themoviedb.org&#10;104.16.61.155 image.tmdb.org"
+        ></textarea>
+        <p class="panel-hint">
+          一行一条，格式 <code>IP 域名</code>（反过来写 <code>域名 IP</code> 也能识别），
+          <code>#</code> 后面是注释；一行可写多个域名。
+          <strong>生效范围</strong>：只作用于本应用自己发出的 HTTP 请求（TMDB 刮削接口），
+          不改系统 hosts 文件、不影响其他程序；同时保留原域名做 TLS 校验，证书不会报错。
+          海报图由界面组件直接加载，不受这里影响——图片域名若也被墙，请改系统 hosts 文件。
+        </p>
+        <div class="toolbar">
+          <button class="btn btn-ghost" :disabled="testing" @click="onTestConnection">
+            {{ testing ? "测试中…" : "保存并测试连接" }}
+          </button>
+        </div>
       </div>
     </div>
 
@@ -200,6 +430,15 @@ async function onOpenDataDir(): Promise<void> {
         {{ media.scanning ? "扫描中…" : "保存并扫描媒体库" }}
       </button>
     </div>
+
+    <!-- 后台扫描的实时反馈：遍历大目录要几十秒，不能让用户以为卡住了 -->
+    <p v-if="media.scanning" class="status">
+      扫描中：{{ media.scanProgress?.phase ?? "准备中" }}
+      <template v-if="media.scanProgress?.found">
+        · 已发现 {{ media.scanProgress.found }} 个视频
+      </template>
+      <button class="mini inline" @click="media.cancelScan()">停止扫描</button>
+    </p>
 
     <p v-if="status" class="status">{{ status }}</p>
 
@@ -260,6 +499,36 @@ label { color: var(--muted); font-size: var(--fs-13); font-weight: 500; }
 .path { font-size: var(--fs-13); word-break: break-all; }
 
 .add { display: flex; gap: 8px; align-items: center; }
+
+.hosts {
+  width: 100%; padding: 10px 12px; border-radius: var(--radius-s);
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-13);
+  line-height: 1.6; resize: vertical; outline: none;
+}
+.hosts:focus { border-color: var(--accent); }
+.hosts::placeholder { color: var(--muted); }
+code {
+  padding: 1px 5px; border-radius: 4px; background: var(--surface-2);
+  font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-12);
+}
+
+.select {
+  padding: 9px 12px; border-radius: var(--radius-s); font-size: var(--fs-13);
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  outline: none; max-width: 260px;
+}
+.select:focus { border-color: var(--accent); }
+
+.panel-hint.split { margin-top: calc(var(--space) * -1); line-height: 1.7; }
+.badge {
+  margin-left: 8px; padding: 2px 8px; border-radius: 999px; font-size: var(--fs-11);
+  font-weight: 500; color: var(--muted); background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.switch { display: flex; align-items: center; gap: 8px; color: var(--text-2); }
+.switch input { width: 15px; height: 15px; accent-color: var(--accent); }
+.narrow { max-width: 150px; }
 
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 

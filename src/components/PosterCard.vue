@@ -2,25 +2,48 @@
 import { computed } from "vue";
 import { imageUrl, type MediaItem } from "../api/commands";
 
-const props = defineProps<{ item: MediaItem }>();
-const emit = defineEmits<{ (e: "open", id: number): void }>();
+const props = defineProps<{
+  item: MediaItem;
+  /** 多选模式下：整张卡的点击变成「勾选 / 取消」，不再进详情。 */
+  selectable?: boolean;
+  selected?: boolean;
+}>();
+const emit = defineEmits<{ (e: "open", id: number): void; (e: "select", id: number): void }>();
 
 const poster = computed(() => imageUrl(props.item.poster_path, "w342"));
 const isTv = computed(() => props.item.type === "tv");
+/** 类型标签：判定不出来的显示「待确认」，不再冒充电影。 */
+const badge = computed(() =>
+  props.item.type === "tv" ? "剧集" : props.item.type === "unknown" ? "待确认" : "电影",
+);
+const placeholderIcon = computed(() =>
+  props.item.type === "tv" ? "📺" : props.item.type === "unknown" ? "❓" : "🎬",
+);
 const score = computed(() =>
   props.item.vote_average ? props.item.vote_average.toFixed(1) : null,
 );
+
+function onClick(): void {
+  if (props.selectable) emit("select", props.item.id);
+  else emit("open", props.item.id);
+}
 </script>
 
 <template>
-  <button class="card" :title="item.display_title" @click="emit('open', item.id)">
+  <button
+    class="card"
+    :class="{ picked: selected, selectable }"
+    :title="selectable ? '点击勾选 / 取消勾选' : item.display_title"
+    @click="onClick"
+  >
     <div class="poster">
+      <span v-if="selectable" class="check" :class="{ on: selected }">{{ selected ? "✓" : "" }}</span>
       <img v-if="poster" :src="poster" :alt="item.display_title" loading="lazy" />
       <div v-else class="placeholder">
-        <span class="icon">{{ isTv ? "📺" : "🎬" }}</span>
+        <span class="icon">{{ placeholderIcon }}</span>
         <span class="ph-title">{{ item.display_title }}</span>
       </div>
-      <span class="badge">{{ isTv ? "剧集" : "电影" }}</span>
+      <span class="badge">{{ badge }}</span>
       <span v-if="isTv && item.episode_count" class="eps">{{ item.episode_count }} 集</span>
       <span v-if="!item.poster_path" class="unscraped" title="尚未刮削">?</span>
     </div>
@@ -46,6 +69,17 @@ const score = computed(() =>
   transition: transform .18s ease, box-shadow .18s ease;
 }
 .card:hover .poster { transform: translateY(-3px); box-shadow: var(--shadow); }
+/* 多选模式：勾上的卡片给个明确的边框反馈 */
+.card.picked .poster { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.check {
+  position: absolute; top: 6px; left: 6px; z-index: 1; width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center; border-radius: 50%;
+  font-size: 12px; font-weight: 700; color: #fff;
+  background: rgba(0, 0, 0, .55); border: 1px solid rgba(255, 255, 255, .6);
+}
+.check.on { background: var(--accent); border-color: transparent; }
+/* 多选模式下左上角让给勾选框，类型标签挪到左下角 */
+.card.selectable .badge { top: auto; bottom: 6px; }
 .poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .placeholder {
   width: 100%; height: 100%; display: flex; flex-direction: column;

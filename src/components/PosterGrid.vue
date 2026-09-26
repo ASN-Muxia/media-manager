@@ -2,8 +2,16 @@
 import PosterCard from "./PosterCard.vue";
 import type { MediaItem } from "../api/commands";
 
-defineProps<{ items: MediaItem[] }>();
-const emit = defineEmits<{ (e: "open", id: number): void }>();
+const props = defineProps<{
+  items: MediaItem[];
+  /** 多选模式（顶栏「选择」开关）：勾选态由父级持有，这里只转发。 */
+  selectable?: boolean;
+  selected?: number[];
+}>();
+const emit = defineEmits<{
+  (e: "open", id: number): void;
+  (e: "select", id: number): void;
+}>();
 </script>
 
 <template>
@@ -12,7 +20,10 @@ const emit = defineEmits<{ (e: "open", id: number): void }>();
       v-for="it in items"
       :key="it.id"
       :item="it"
+      :selectable="props.selectable"
+      :selected="props.selected?.includes(it.id)"
       @open="(id) => emit('open', id)"
+      @select="(id) => emit('select', id)"
     />
   </div>
   <div v-else class="empty">
