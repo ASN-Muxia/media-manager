@@ -7,7 +7,7 @@
 //! - `GET /v3/movies/{tmdb_id}`  电影
 //! - `GET /v3/tv/{tvdb_id}`      剧集（注意用的是 TheTVDB 的 id）
 
-use crate::http;
+use crate::provider::http;
 use serde_json::Value;
 
 const API_BASE: &str = "https://webservice.fanart.tv/v3";
@@ -43,7 +43,7 @@ impl FanartClient {
         http::get_json::<Value>(
             &self.agent,
             "Fanart.tv",
-            &format!("{API_BASE}{path}?api_key={}", crate::tmdb::urlencode(&self.api_key)),
+            &format!("{API_BASE}{path}?api_key={}", crate::provider::tmdb::urlencode(&self.api_key)),
             &[],
         )
     }

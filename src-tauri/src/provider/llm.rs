@@ -21,8 +21,8 @@
 //! 走 OpenAI 兼容的 `/chat/completions`，所以 DeepSeek、通义千问、
 //! 智谱、 moonshot、本地 Ollama / vLLM 都能直接填进去。
 
-use crate::http;
-use crate::parser::{is_video_file, ParsedName};
+use crate::provider::http;
+use crate::core::parser::{is_video_file, ParsedName};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -418,7 +418,7 @@ mod tests {
     /// 正则已经解析得很好时，不该去打扰大模型
     #[test]
     fn good_regex_result_needs_no_enhancement() {
-        let p = crate::parser::parse_file_name("Breaking.Bad.S01E01.1080p.mkv");
+        let p = crate::core::parser::parse_file_name("Breaking.Bad.S01E01.1080p.mkv");
         assert!(!needs_enhancement(&p, "Breaking.Bad.S01E01.1080p.mkv"));
     }
 

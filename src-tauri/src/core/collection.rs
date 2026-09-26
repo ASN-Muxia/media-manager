@@ -33,7 +33,8 @@
 //! 默认按**上映时间**（`year` 升序）；同年按片名、再按 id，保证结果稳定。
 //! 没有年份的排在最后。
 
-use crate::grouping::normalize_title;
+use crate::core::grouping::normalize_title;
+use crate::util::lazy_re;
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -90,14 +91,7 @@ pub struct CollectionPlan {
     pub duplicates: usize,
 }
 
-macro_rules! lazy_re {
-    ($fn_name:ident, $pat:expr) => {
-        fn $fn_name() -> &'static Regex {
-            static R: OnceLock<Regex> = OnceLock::new();
-            R.get_or_init(|| Regex::new($pat).expect("内置正则应可编译"))
-        }
-    };
-}
+// `lazy_re!` 在 `crate::util` 里只有一份定义，这里 import 即可。
 
 // 尾部的续作标记：`2` / `II` / `Part 2` / `Part Two` / `第二部` …
 lazy_re!(

@@ -11,7 +11,11 @@
     "test": "node scripts/run-tests.mjs",
     "test:watch": "node scripts/run-tests.mjs --watch",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "package": "node scripts/package.mjs",
+    "package:gz": "node scripts/package.mjs --format gz",
+    "package:dry": "node scripts/package.mjs --dry",
+    "verify:delta": "node scripts/verify-delta.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

@@ -6,7 +6,7 @@
 //! 前端 JS 跑起来了、命令桥也通了。
 
 use crate::boot::READY_MARKER;
-use crate::db;
+use crate::store::db;
 use std::sync::Mutex;
 use tauri::{AppHandle, State};
 

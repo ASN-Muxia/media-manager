@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
-use crate::db;
+use crate::store::db;
 
 /// 自愈子进程标记：由父进程显式 spawn 时传入，标明"你是自愈轮次"。
 const RETRY_ENV: &str = "MM_WEBVIEW_RETRY";

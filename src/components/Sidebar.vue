@@ -14,6 +14,7 @@ import {
   categoryView, tagView, VIEW_ALL, VIEW_COLLECTIONS, VIEW_MOVIE, VIEW_SETTINGS,
   VIEW_TV, VIEW_UNKNOWN, VIEW_UNCLASSIFIED, type ViewKey,
 } from "../types";
+import { MEDIA_TYPE_ICON } from "../constants/mediaType";
 
 const props = defineProps<{ modelValue: ViewKey }>();
 const emit = defineEmits<{ (e: "update:modelValue", v: ViewKey): void }>();
@@ -22,10 +23,10 @@ const cat = useCategoryStore();
 
 const entries: { key: ViewKey; label: string; icon: string }[] = [
   { key: VIEW_ALL, label: "全部", icon: "📁" },
-  { key: VIEW_MOVIE, label: "电影", icon: "🎬" },
-  { key: VIEW_TV, label: "剧集", icon: "📺" },
+  { key: VIEW_MOVIE, label: "电影", icon: MEDIA_TYPE_ICON.movie },
+  { key: VIEW_TV, label: "剧集", icon: MEDIA_TYPE_ICON.tv },
   // 判定不出类型的条目单独放一栏：不再让它们无声无息地混进「电影」。
-  { key: VIEW_UNKNOWN, label: "待确认", icon: "❓" },
+  { key: VIEW_UNKNOWN, label: "待确认", icon: MEDIA_TYPE_ICON.unknown },
   // 同一系列 / IP 的电影归到一起（派生视图，按上映时间排序）。
   { key: VIEW_COLLECTIONS, label: "系列合集", icon: "🎞" },
 ];

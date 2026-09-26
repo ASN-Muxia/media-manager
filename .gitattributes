@@ -1,0 +1,43 @@
+# ============================================================
+# 换行归一：源文件统一 LF，批处理统一 CRLF
+#
+# 约束来自本项目踩过的坑：`.bat` 必须是 **GBK + CRLF**，缺任一条都会被 cmd
+# 解析成一行团并报 `'xxx' 不是内部或外部命令`。这里显式把 batch/vbs 钉死在
+# CRLF，其余源码统一 LF——单一换行能让 git 的行级 delta、以及各类增量同步
+# 工具更容易找到可复用块，也避免不同开发者检出后出现整文件「全都变了」。
+# ============================================================
+*.rs   text eol=lf
+*.ts   text eol=lf
+*.vue  text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.css  text eol=lf
+*.toml text eol=lf
+*.py   text eol=lf
+*.html text eol=lf
+
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.vbs  text eol=crlf
+*.ps1  text eol=crlf
+
+# ============================================================
+# 二进制：不做行级 diff / 不做换行转换
+#
+# 图标与应用产物按二进制处理，避免 git 对它们尝试文本增量（既慢又几乎无损率）。
+# 若日后要替换图标，请优先考虑带体积更小的尺寸的 ico（当前 icon.ico 372 KB，
+# 是整个源码包的 ~18%）。
+# ============================================================
+*.png  binary
+*.ico  binary
+*.jpg  binary
+*.exe  binary
+*.dll  binary
+*.pdb  binary
+
+# 生成物：不参与 diff 与语言统计
+package-lock.json linguist-generated -diff
+Cargo.lock        linguist-generated -diff
+src-tauri/gen/**  linguist-generated -diff

@@ -10,7 +10,7 @@
 //! - `GET  /series/{id}/extended`          剧集详情（含类型）
 //! - `GET  /series/{id}/episodes/default`  全季集列表
 
-use crate::http;
+use crate::provider::http;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Mutex;
@@ -173,7 +173,7 @@ impl TvdbClient {
     pub fn search(&self, name: &str) -> Result<Vec<TvdbSeries>, String> {
         let resp: Envelope<SearchData> = self.auth_get(&format!(
             "/search?query={}&type=series",
-            crate::tmdb::urlencode(name)
+            crate::provider::tmdb::urlencode(name)
         ))?;
         Ok(resp.data.map(|d| d.series).unwrap_or_default())
     }

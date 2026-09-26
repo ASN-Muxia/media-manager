@@ -9,7 +9,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::time::Duration;
 
 const API_BASE: &str = "https://api.themoviedb.org/3";
 
@@ -312,11 +311,9 @@ impl TmdbClient {
         hosts: &[String],
         language: &str,
     ) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(20))
-            .user_agent("media-manager/0.1 (+tauri)")
-            .resolver(HostsResolver::from_lines(hosts))
-            .build();
+        // 复用共享的 agent 构造：超时、UA、自定义解析与其余供应方保持一致。
+        //（原先这里自己拼一遍 `AgentBuilder`，参数与 `http::build_agent` 逐项相同。）
+        let agent = crate::provider::http::build_agent(hosts, 20);
         Self {
             agent,
             api_key: api_key.into(),
@@ -345,16 +342,8 @@ impl TmdbClient {
             url.push('=');
             url.push_str(&urlencode(v));
         }
-        let resp = self.agent.get(&url).call().map_err(|e| match e {
-            ureq::Error::Status(401, _) => {
-                "TMDB 鉴权失败（401）：请检查设置里的 API Key".to_string()
-            }
-            ureq::Error::Status(404, _) => "TMDB 未找到对应资源（404）".to_string(),
-            ureq::Error::Status(code, _) => format!("TMDB 请求失败（HTTP {code}）"),
-            other => format!("TMDB 网络请求失败：{other}"),
-        })?;
-        resp.into_json::<T>()
-            .map_err(|e| format!("TMDB 响应解析失败：{e}"))
+        // 走共享实现（`http::get_json`），顺带补齐原先缺失的 403 / 429 错误文案。
+        crate::provider::http::get_json::<T>(&self.agent, "TMDB", &url, &[])
     }
 
     /// 搜索电影 / 剧集。`kind` 为 `movie` 或 `tv`。

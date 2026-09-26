@@ -7,6 +7,7 @@ import {
 } from "../api/commands";
 import { useMediaStore } from "../stores/mediaStore";
 import { useCategoryStore } from "../stores/categoryStore";
+import { formatScore, typeIcon, typeLabel } from "../constants/mediaType";
 
 const store = useMediaStore();
 const catStore = useCategoryStore();
@@ -66,18 +67,10 @@ function epTitle(e: Episode): string {
 const detail = computed(() => store.detail);
 const poster = computed(() => imageUrl(detail.value?.media.poster_path, "w342"));
 const backdrop = computed(() => imageUrl(detail.value?.media.backdrop_path, "w1280"));
-const score = computed(() =>
-  detail.value?.media.vote_average ? detail.value.media.vote_average.toFixed(1) : null,
-);
-/** 类型标签：`unknown` 是「判定不出来」，不能显示成电影。 */
-const typeLabel = computed(() => {
-  const t = detail.value?.media.type;
-  return t === "tv" ? "剧集" : t === "unknown" ? "待确认" : "电影";
-});
-const typeIcon = computed(() => {
-  const t = detail.value?.media.type;
-  return t === "tv" ? "📺" : t === "unknown" ? "❓" : "🎬";
-});
+const score = computed(() => formatScore(detail.value?.media.vote_average));
+/** 类型标签 / 图标：`unknown` 是「判定不出来」，不能显示成电影。 */
+const mediaTypeLabel = computed(() => typeLabel(detail.value?.media.type));
+const mediaTypeIcon = computed(() => typeIcon(detail.value?.media.type));
 /** 单文件条目（电影，以及还没定型的「待确认」）都能直接播放。 */
 const isSingleFile = computed(() => detail.value?.media.type !== "tv");
 
@@ -253,11 +246,11 @@ function pick(it: TmdbSearchItem): void {
       <div class="shade"></div>
       <div class="head-inner">
         <img v-if="poster" class="poster" :src="poster" :alt="detail.media.display_title" />
-        <div v-else class="poster ph">{{ typeIcon }}</div>
+        <div v-else class="poster ph">{{ mediaTypeIcon }}</div>
         <div class="info">
           <h2>{{ detail.media.display_title }}</h2>
           <p class="line">
-            <span class="tag">{{ typeLabel }}</span>
+            <span class="tag">{{ mediaTypeLabel }}</span>
             <span v-if="detail.media.year">{{ detail.media.year }}</span>
             <span v-if="detail.media.genre">{{ detail.media.genre }}</span>
             <span v-if="score" class="score">★ {{ score }}</span>

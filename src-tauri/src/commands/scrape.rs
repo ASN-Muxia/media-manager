@@ -31,19 +31,19 @@
 //! 关掉大模型，刮削行为与加这个模块之前**完全一致**。
 
 use crate::commands::catalog;
+use super::control::ScrapeControl;
 use crate::commands::settings::{
     load_fanart_key, load_hosts, load_llm_config, load_omdb_key, load_tmdb_key,
     load_tmdb_language, load_tvdb_key,
 };
-use crate::db::now_epoch;
-use crate::fanart::{Art, FanartClient};
-use crate::llm::LlmConfig;
-use crate::omdb::OmdbClient;
-use crate::tmdb::{TmdbClient, TmdbSearchItem};
-use crate::tvdb::TvdbClient;
+use crate::store::db::now_epoch;
+use crate::provider::fanart::{Art, FanartClient};
+use crate::provider::llm::LlmConfig;
+use crate::provider::omdb::OmdbClient;
+use crate::provider::tmdb::{TmdbClient, TmdbSearchItem};
+use crate::provider::tvdb::TvdbClient;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
@@ -139,39 +139,6 @@ pub struct ScrapeStart {
     pub message: String,
 }
 
-/// 批量刮削的控制开关：取消标志 + 运行中标志。
-///
-/// 放在 `Arc` 里由 app 托管，后台线程与命令共享同一个实例。
-#[derive(Debug, Default)]
-pub struct ScrapeControl {
-    cancel: AtomicBool,
-    running: AtomicBool,
-}
-
-impl ScrapeControl {
-    /// 开始新一轮：先复位取消标志，再置运行中。
-    pub fn begin(&self) {
-        self.cancel.store(false, Ordering::SeqCst);
-        self.running.store(true, Ordering::SeqCst);
-    }
-
-    pub fn finish(&self) {
-        self.running.store(false, Ordering::SeqCst);
-    }
-
-    pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
-    }
-
-    pub fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst)
-    }
-
-    pub fn running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-}
-
 /// 一次刮削要用的全部外部数据源。
 ///
 /// 只有 TMDb 是**必需**的（没有它就谈不上刮削）；其余全部可选，
@@ -242,7 +209,7 @@ fn read_pending(conn: &Connection, id: i64) -> Result<PendingRow, String> {
     .map_err(|e| format!("未找到媒体 id={id}: {e}"))
 }
 
-fn update_meta(conn: &Connection, id: i64, tmdb_id: i64, meta: &crate::tmdb::TmdbMeta) -> Result<(), String> {
+fn update_meta(conn: &Connection, id: i64, tmdb_id: i64, meta: &crate::provider::tmdb::TmdbMeta) -> Result<(), String> {
     conn.execute(
         "UPDATE media SET tmdb_id = ?2, \
                 title = CASE WHEN ?3 = '' THEN title ELSE ?3 END, \
@@ -337,7 +304,7 @@ fn pick_tmdb_id(
                 .iter()
                 .find(|it| {
                     year.is_some()
-                        && crate::tmdb::year_from_date(it.date().as_deref()) == year
+                        && crate::provider::tmdb::year_from_date(it.date().as_deref()) == year
                 })
                 .or_else(|| items.first())
                 .map(|it| it.id)
@@ -545,17 +512,17 @@ fn refine_title_with_llm(p: &Providers, conn: &Connection, id: i64, pending: &Pe
         return None;
     }
     // 正则已经认出来了就别打扰模型
-    let base = crate::parser::parse_file_name(file_name);
+    let base = crate::core::parser::parse_file_name(file_name);
     let stem = file_name
         .rsplit_once('.')
         .map(|(s, _)| s)
         .unwrap_or(file_name);
     let junk = pending.title.trim().is_empty() || pending.title.trim() == stem.trim();
-    if !junk && !crate::llm::needs_enhancement(&base, file_name) {
+    if !junk && !crate::provider::llm::needs_enhancement(&base, file_name) {
         return None;
     }
 
-    let (improved, fields) = crate::llm::enhance(base, file_name, &p.llm, &p.hosts);
+    let (improved, fields) = crate::provider::llm::enhance(base, file_name, &p.llm, &p.hosts);
     let Some(f) = fields else {
         return None; // 未启用 / 调用失败 → 静默回退
     };
@@ -728,7 +695,7 @@ pub async fn scrape_media(
 
     // 后台线程用自己的连接：WAL 模式下多连接并发读写是安全的。
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = crate::db::open(&app).map_err(|e| format!("打开数据库失败: {e}"))?;
+        let conn = crate::store::db::open(&app).map_err(|e| format!("打开数据库失败: {e}"))?;
         // 后台线程自己读设置装配 provider，不占主线程的连接锁
         let providers = Providers::load(&conn, &key, hosts, &language);
         scrape_one(&conn, &providers, id, tmdb_id)
@@ -822,7 +789,7 @@ fn run_batch(
         let _ = app.emit(PROGRESS_EVENT, p);
     };
 
-    let conn = match crate::db::open(&app) {
+    let conn = match crate::store::db::open(&app) {
         Ok(c) => c,
         Err(e) => {
             emit(ScrapeProgress::aborted(format!("打开数据库失败: {e}")));
@@ -959,12 +926,12 @@ pub fn llm_presets() -> Vec<LlmPreset> {
     // 推荐的文本模型与视觉模型不同源（DeepSeek / 百炼），所以两个地址都给全。
     let mut out = vec![LlmPreset {
         label: "推荐 · DeepSeek + 通义千问 VL".to_string(),
-        base_url: crate::llm::RECOMMENDED_BASE_URL.to_string(),
-        model: crate::llm::RECOMMENDED_MODEL.to_string(),
-        vision_model: crate::llm::RECOMMENDED_VISION_MODEL.to_string(),
-        vision_base_url: crate::llm::RECOMMENDED_VISION_BASE_URL.to_string(),
+        base_url: crate::provider::llm::RECOMMENDED_BASE_URL.to_string(),
+        model: crate::provider::llm::RECOMMENDED_MODEL.to_string(),
+        vision_model: crate::provider::llm::RECOMMENDED_VISION_MODEL.to_string(),
+        vision_base_url: crate::provider::llm::RECOMMENDED_VISION_BASE_URL.to_string(),
     }];
-    for (label, base) in crate::llm::ALTERNATIVE_MODELS {
+    for (label, base) in crate::provider::llm::ALTERNATIVE_MODELS {
         out.push(LlmPreset {
             label: label.to_string(),
             base_url: base.to_string(),
@@ -985,7 +952,7 @@ pub fn llm_presets() -> Vec<LlmPreset> {
 pub async fn llm_parse_name(
     state: State<'_, Mutex<Connection>>,
     file_name: String,
-) -> Result<crate::llm::ParsedFields, String> {
+) -> Result<crate::provider::llm::ParsedFields, String> {
     let (cfg, hosts) = {
         let conn = state.lock().map_err(|e| e.to_string())?;
         (load_llm_config(&conn), load_hosts(&conn))
@@ -994,7 +961,7 @@ pub async fn llm_parse_name(
         return Err("大模型解析未启用或未填写接口地址".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        crate::llm::LlmClient::new(cfg, &hosts).parse_name(&file_name)
+        crate::provider::llm::LlmClient::new(cfg, &hosts).parse_name(&file_name)
     })
     .await
     .map_err(|e| format!("解析任务异常退出: {e}"))?
@@ -1009,8 +976,8 @@ pub async fn llm_parse_image(
     state: State<'_, Mutex<Connection>>,
     file_name: String,
     image_data_url: String,
-) -> Result<crate::llm::ParsedFields, String> {
-    if !crate::llm::is_undecidable(&file_name) {
+) -> Result<crate::provider::llm::ParsedFields, String> {
+    if !crate::provider::llm::is_undecidable(&file_name) {
         return Err("该文件名可以推断出片名，不需要视觉识别".to_string());
     }
     let (cfg, hosts) = {
@@ -1021,7 +988,7 @@ pub async fn llm_parse_image(
         return Err("未启用视觉模型".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        crate::llm::LlmClient::new(cfg, &hosts).parse_image(&file_name, &image_data_url)
+        crate::provider::llm::LlmClient::new(cfg, &hosts).parse_image(&file_name, &image_data_url)
     })
     .await
     .map_err(|e| format!("识别任务异常退出: {e}"))?
@@ -1045,7 +1012,7 @@ pub async fn tvdb_apply(
         return Err("尚未配置 TheTVDB API Key，请先到「设置」填写".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = crate::db::open(&app).map_err(|e| format!("打开数据库失败: {e}"))?;
+        let conn = crate::store::db::open(&app).map_err(|e| format!("打开数据库失败: {e}"))?;
         let client = TvdbClient::with_hosts(key, &hosts);
         let id = match tvdb_id {
             Some(v) => v,
@@ -1115,240 +1082,5 @@ pub async fn omdb_lookup(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn new_control() -> Arc<ScrapeControl> {
-        Arc::new(ScrapeControl::default())
-    }
-
-    #[test]
-    fn control_begin_resets_cancel_flag() {
-        let c = new_control();
-        c.request_cancel();
-        assert!(c.cancelled());
-        c.begin();
-        assert!(!c.cancelled(), "新一轮开始时应复位取消标志");
-        assert!(c.running());
-        c.finish();
-        assert!(!c.running());
-    }
-
-    #[test]
-    fn cancel_is_visible_to_worker_thread() {
-        let c = new_control();
-        c.begin();
-        let worker = c.clone();
-        assert!(!worker.cancelled());
-        c.request_cancel();
-        assert!(worker.cancelled(), "后台线程应能看到取消标志");
-    }
-
-    #[test]
-    fn progress_tick_reports_counts() {
-        let p = ScrapeProgress::tick(10, 3, 2, 1, "某部电影".to_string());
-        assert!(p.running);
-        assert!(!p.finished);
-        assert_eq!((p.total, p.done, p.ok, p.failed), (10, 3, 2, 1));
-        assert_eq!(p.current, "某部电影");
-    }
-
-    #[test]
-    fn progress_done_message_differs_for_cancel() {
-        let normal = ScrapeProgress::done(10, 8, 2, false);
-        assert!(normal.finished && !normal.running && !normal.cancelled);
-        assert!(normal.message.contains("成功 8"));
-
-        let cancelled = ScrapeProgress::done(10, 3, 1, true);
-        assert!(cancelled.cancelled);
-        assert!(cancelled.message.contains("已取消"));
-    }
-
-    #[test]
-    fn progress_aborted_carries_reason() {
-        let p = ScrapeProgress::aborted("打开数据库失败".to_string());
-        assert!(p.finished && !p.running);
-        assert_eq!(p.message, "打开数据库失败");
-    }
-
-    /// 被取消后应立刻收敛：不再处理后续条目。
-    #[test]
-    fn cancelled_batch_stops_before_new_items() {
-        let c = new_control();
-        c.begin();
-        let ids = vec![1, 2, 3, 4];
-        let mut processed = 0;
-        for _ in &ids {
-            if c.cancelled() {
-                break;
-            }
-            processed += 1;
-            c.request_cancel(); // 模拟处理完第一条后用户点了取消
-        }
-        assert_eq!(processed, 1, "取消后不应继续处理后续条目");
-        assert!(ScrapeProgress::done(ids.len() as i64, 1, 0, true).cancelled);
-    }
-
-    /// 取消时 `done` 只统计真正处理过的条数，未处理的不算失败。
-    #[test]
-    fn cancelled_progress_does_not_count_skipped_as_failed() {
-        let p = ScrapeProgress::done(10, 2, 0, true);
-        assert_eq!(p.done, 2);
-        assert_eq!(p.failed, 0);
-        assert!(p.message.contains("跳过 8"));
-    }
-
-    /* --------------------- 可选 provider 的规则 --------------------- */
-
-    fn memory_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        crate::db::migrate(&conn).unwrap();
-        conn
-    }
-
-    /// 设置项键名与 `commands/settings.rs` 保持一致。
-    fn put_setting(conn: &Connection, key: &str, value: &str) {
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn optional_providers_are_absent_without_keys() {
-        let conn = memory_db();
-        let p = Providers::load(&conn, "tmdb-key", vec![], "zh-CN");
-        assert!(p.tvdb.is_none(), "没配 Key 时 TheTVDB 应整段缺席");
-        assert!(p.fanart.is_none());
-        assert!(p.omdb.is_none());
-        assert!(!p.llm.usable(), "大模型默认必须是关闭的");
-        assert!(!p.has_tvdb());
-    }
-
-    #[test]
-    fn providers_appear_once_keys_are_configured() {
-        let conn = memory_db();
-        put_setting(&conn, "tvdbKey", "tv-1");
-        put_setting(&conn, "fanartKey", "fa-1");
-        put_setting(&conn, "omdbKey", "om-1");
-        put_setting(&conn, "llmEnabled", "1");
-        put_setting(&conn, "llmBaseUrl", crate::llm::RECOMMENDED_BASE_URL);
-        let p = Providers::load(&conn, "tmdb-key", vec![], "zh-CN");
-        assert!(p.tvdb.is_some() && p.fanart.is_some() && p.omdb.is_some());
-        assert!(p.has_tvdb());
-        assert!(p.llm.usable());
-        assert_eq!(p.llm.model(), crate::llm::RECOMMENDED_MODEL, "没填模型时应回落到推荐模型");
-    }
-
-    #[test]
-    fn art_is_only_filled_when_missing() {
-        let art = Art {
-            poster: Some("https://f/p.jpg".to_string()),
-            backdrop: Some("https://f/b.jpg".to_string()),
-        };
-        // 全空 → 两张都补
-        let (p, b) = merge_art(None, None, &art);
-        assert_eq!(p.as_deref(), Some("https://f/p.jpg"));
-        assert_eq!(b.as_deref(), Some("https://f/b.jpg"));
-
-        // 空串也算"没有"
-        let (p, _) = merge_art(Some("".to_string()), None, &art);
-        assert!(p.is_some());
-
-        // 已有 TMDb 的图 → 一律不动
-        let (p, b) = merge_art(Some("/tmdb.jpg".to_string()), Some("/bg.jpg".to_string()), &art);
-        assert!(p.is_none() && b.is_none(), "已有图不应被 Fanart 覆盖");
-
-        // 只缺背景时只补背景
-        let (p, b) = merge_art(Some("/tmdb.jpg".to_string()), None, &art);
-        assert!(p.is_none());
-        assert!(b.is_some());
-    }
-
-    #[test]
-    fn rating_is_only_filled_when_missing() {
-        assert_eq!(merge_rating(None, Some(8.0)), Some(8.0));
-        assert_eq!(merge_rating(Some(0.0), Some(8.0)), Some(8.0), "0 分视为没有评分");
-        assert_eq!(merge_rating(Some(7.3), Some(8.0)), None, "已有评分不应被覆盖");
-        assert_eq!(merge_rating(None, None), None);
-        assert_eq!(merge_rating(None, Some(12.0)), None, "越界值当没查到");
-    }
-
-    /// 没配 OMDb / Fanart 时，补漏步骤应该是零成本的空转，而不是报错
-    #[test]
-    fn missing_providers_make_supplements_noop() {
-        let conn = memory_db();
-        conn.execute(
-            "INSERT INTO media (type, title, added_at, updated_at) VALUES ('movie', 'X', 0, 0)",
-            [],
-        )
-        .unwrap();
-        let id = conn.last_insert_rowid();
-        let p = Providers::load(&conn, "tmdb-key", vec![], "zh-CN");
-        assert!(!fill_rating_from_omdb(&p, &conn, id, "X", None));
-        assert!(!fill_art_from_fanart(&p, &conn, id, "movie", 1));
-        assert_eq!(fill_episodes_from_tvdb(&p, &conn, id, "X"), (0, None));
-    }
-
-    /// 大模型回流：脏文件名被认出来后，分辨率 / 来源要落到现有字段
-    #[test]
-    fn llm_refine_is_silent_when_disabled() {
-        let conn = memory_db();
-        conn.execute(
-            "INSERT INTO media (type, title, file_name, added_at, updated_at) \
-             VALUES ('movie', '00123', '00123.mkv', 0, 0)",
-            [],
-        )
-        .unwrap();
-        let id = conn.last_insert_rowid();
-        let p = Providers::load(&conn, "tmdb-key", vec![], "zh-CN");
-        let pending = read_pending(&conn, id).unwrap();
-        assert_eq!(pending.title, "00123");
-        assert_eq!(pending.file_name.as_deref(), Some("00123.mkv"));
-        // 未启用 → 静默返回 None，绝不抛错
-        assert!(refine_title_with_llm(&p, &conn, id, &pending).is_none());
-    }
-
-    /// 预设要让设置页能「一键填入」，推荐项必须四个字段都齐
-    #[test]
-    fn llm_presets_put_recommendation_first() {
-        let list = llm_presets();
-        assert_eq!(list[0].label, "推荐 · DeepSeek + 通义千问 VL");
-        assert_eq!(list[0].model, crate::llm::RECOMMENDED_MODEL);
-        assert_eq!(list[0].base_url, crate::llm::RECOMMENDED_BASE_URL);
-        assert_eq!(list[0].vision_model, crate::llm::RECOMMENDED_VISION_MODEL);
-        assert!(!list[0].vision_base_url.is_empty());
-        // 备选至少给出地址，方便用户照着填
-        assert!(list.len() > 1);
-        assert!(list[1].base_url.starts_with("http"));
-    }
-
-    /// 刮削回填里，剧集的 file_name 要能回退到第一集（脏文件名兜底要用）
-    #[test]
-    fn pending_file_name_falls_back_to_first_episode() {
-        let conn = memory_db();
-        conn.execute(
-            "INSERT INTO media (type, title, added_at, updated_at) VALUES ('tv', '剧', 0, 0)",
-            [],
-        )
-        .unwrap();
-        let id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO episodes (media_id, season, episode, file_name, added_at) \
-             VALUES (?1, 2, 1, 'S02E01.mkv', 0)",
-            params![id],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO episodes (media_id, season, episode, file_name, added_at) \
-             VALUES (?1, 1, 1, 'S01E01.mkv', 0)",
-            params![id],
-        )
-        .unwrap();
-        let pending = read_pending(&conn, id).unwrap();
-        assert_eq!(pending.file_name.as_deref(), Some("S01E01.mkv"));
-    }
-}
+#[path = "tests/scrape.rs"]
+mod tests;

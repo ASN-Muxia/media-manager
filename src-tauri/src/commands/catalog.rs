@@ -51,7 +51,7 @@ pub struct SyncResult {
 }
 
 fn now() -> i64 {
-    crate::db::now_epoch()
+    crate::store::db::now_epoch()
 }
 
 /* --------------------------- 分类 --------------------------- */
@@ -454,7 +454,7 @@ fn pairs_count(conn: &Connection) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
+    use crate::store::db;
 
     fn memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

@@ -9,6 +9,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 同上：必须在 build 依赖图里也把 `std` 打开。
+#
+# edition 2021 默认用 resolver v2，**build-dependencies 与 dependencies 的特性
+# 不再互相统一**——只在 `[dependencies]` 里写这条，编译 tauri-build 那一侧时
+# indexmap 仍然是「无 std」的那份，`has_std` 依旧不发射。两侧都要写才干净。
+indexmap = { version = "1.9.3", features = ["std"] }
 
 [features]
 # 开启后前端资源会被**嵌入到二进制**里，应用可脱离 vite dev server 独立运行。
@@ -51,3 +57,17 @@ walkdir = "2.5.0"
 regex = "1.13.1"
 ureq = { version = "2", features = ["json"] }
 tauri-plugin-dialog = "2.7.3"
+
+# 构建可复现性补丁：显式打开 indexmap 1.x 的 `std` 开关。
+#
+# 背景：indexmap 1.9.3 **没有默认特性**，它的 build.rs 靠 autocfg 现场编译一个
+# `extern crate std;` 的探测程序来决定要不要发射 cfg(has_std)。探测一旦失败，
+# autocfg 会静默降级（只在 stderr 留一行 "could not probe for `std`"），
+# 于是 `IndexMap` 的第三个泛型参数拿不到默认值，下游 schemars 0.8.22 的
+# `type Map<K, V> = indexmap::IndexMap<K, V>` 立刻报
+# `E0107: struct takes 3 generic arguments but 2 were supplied`，
+# **干净重建（cargo clean 后 / 新克隆的机器）会直接失败**，依赖缓存才能编过。
+#
+# 打开 `std` 之后，build.rs 会走 `CARGO_FEATURE_STD` 分支直接发射 has_std，
+# 不再依赖那个脆弱的运行时探测——这也是本项目要「可被别人 clone 后构建」的前提。
+indexmap = { version = "1.9.3", features = ["std"] }

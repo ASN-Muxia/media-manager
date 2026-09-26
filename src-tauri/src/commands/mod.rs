@@ -1,3 +1,4 @@
+pub mod control;
 pub mod catalog;
 pub mod diag;
 pub mod media;

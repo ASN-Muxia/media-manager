@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { imageUrl, type MediaItem } from "../api/commands";
+import { formatScore, typeIcon, typeLabel } from "../constants/mediaType";
 
 const props = defineProps<{
   item: MediaItem;
@@ -12,16 +13,10 @@ const emit = defineEmits<{ (e: "open", id: number): void; (e: "select", id: numb
 
 const poster = computed(() => imageUrl(props.item.poster_path, "w342"));
 const isTv = computed(() => props.item.type === "tv");
-/** 类型标签：判定不出来的显示「待确认」，不再冒充电影。 */
-const badge = computed(() =>
-  props.item.type === "tv" ? "剧集" : props.item.type === "unknown" ? "待确认" : "电影",
-);
-const placeholderIcon = computed(() =>
-  props.item.type === "tv" ? "📺" : props.item.type === "unknown" ? "❓" : "🎬",
-);
-const score = computed(() =>
-  props.item.vote_average ? props.item.vote_average.toFixed(1) : null,
-);
+/** 类型标签：判定不出来的显示「待确认」，不再冒充电影。文案统一来自 `constants/mediaType`。 */
+const badge = computed(() => typeLabel(props.item.type));
+const placeholderIcon = computed(() => typeIcon(props.item.type));
+const score = computed(() => formatScore(props.item.vote_average));
 
 function onClick(): void {
   if (props.selectable) emit("select", props.item.id);

@@ -1,17 +1,12 @@
+// 分层要点：`core`（领域规则）/ `provider`（外部数据源）/ `store`（持久化）
+// 三者互不反向依赖，只有最上面这层的 `commands` 会同时用到它们。
+// 好处是改 UI 或换数据库时不用碰判定逻辑，反之亦然。
 mod boot;
-mod collection;
 mod commands;
-mod db;
-mod fanart;
-mod grouping;
-mod mediatype;
-mod http;
-mod llm;
-mod omdb;
-mod parser;
-mod scanner;
-mod tmdb;
-mod tvdb;
+mod core;
+mod provider;
+mod store;
+mod util;
 
 use serde::Serialize;
 use std::sync::Mutex;
@@ -41,13 +36,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // 打开（必要时创建）SQLite 数据库并注入全局连接。
-            let conn = db::open(app.handle())
+            let conn = store::db::open(app.handle())
                 .map_err(|e| std::io::Error::other(format!("数据库初始化失败: {e}")))?;
             app.manage(Mutex::new(conn));
             // 批量刮削的取消开关：后台线程读它，前端通过 `cancel_scrape` 置位。
-            app.manage(std::sync::Arc::new(commands::scrape::ScrapeControl::default()));
+            app.manage(std::sync::Arc::new(commands::control::ScrapeControl::default()));
             // 扫描的取消开关（同上，供 `cancel_scan` 置位）。
-            app.manage(std::sync::Arc::new(commands::media::ScanControl::default()));
+            app.manage(std::sync::Arc::new(commands::control::ScanControl::default()));
             // 清掉上一次的就绪标记，再看住这一次——前端没起来就等于白屏，
             // 看门狗会兜底重置并重启一次，而不是让用户对着空窗口发呆。
             boot::clear_ready_marker(app.handle());

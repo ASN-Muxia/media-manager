@@ -16,7 +16,7 @@ pub fn build_agent(hosts: &[String], timeout_secs: u64) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(timeout_secs))
         .user_agent("media-manager/0.1 (+tauri)")
-        .resolver(crate::tmdb::HostsResolver::from_lines(hosts))
+        .resolver(crate::provider::tmdb::HostsResolver::from_lines(hosts))
         .build()
 }
 

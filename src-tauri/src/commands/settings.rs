@@ -2,7 +2,7 @@
 //!
 //! 前端契约（`src/stores/settingsStore.ts`）：`{ tmdbKey, mediaDirs, potPlayerPath }`。
 
-use crate::db;
+use crate::store::db;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -75,7 +75,7 @@ impl Default for Settings {
             media_dirs: Vec::new(),
             pot_player_path: String::new(),
             hosts: Vec::new(),
-            tmdb_language: crate::tmdb::DEFAULT_LANGUAGE.to_string(),
+            tmdb_language: crate::provider::tmdb::DEFAULT_LANGUAGE.to_string(),
             tvdb_key: String::new(),
             fanart_key: String::new(),
             omdb_key: String::new(),
@@ -132,7 +132,7 @@ pub fn load_hosts(conn: &Connection) -> Vec<String> {
 pub fn load_tmdb_language(conn: &Connection) -> String {
     let v = read_value(conn, KEY_LANGUAGE).unwrap_or_default();
     if v.trim().is_empty() {
-        crate::tmdb::DEFAULT_LANGUAGE.to_string()
+        crate::provider::tmdb::DEFAULT_LANGUAGE.to_string()
     } else {
         v.trim().to_string()
     }
@@ -154,8 +154,8 @@ pub fn load_omdb_key(conn: &Connection) -> String {
 }
 
 /// 读取大模型配置（脏文件名解析增强层，可选）。
-pub fn load_llm_config(conn: &Connection) -> crate::llm::LlmConfig {
-    crate::llm::LlmConfig {
+pub fn load_llm_config(conn: &Connection) -> crate::provider::llm::LlmConfig {
+    crate::provider::llm::LlmConfig {
         enabled: read_value(conn, KEY_LLM_ENABLED)
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn language_falls_back_to_default_when_unset() {
         let conn = memory_db();
-        assert_eq!(load_tmdb_language(&conn), crate::tmdb::DEFAULT_LANGUAGE);
+        assert_eq!(load_tmdb_language(&conn), crate::provider::tmdb::DEFAULT_LANGUAGE);
     }
 
     #[test]
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(load_tmdb_language(&conn), "en-US");
 
         write_value(&conn, KEY_LANGUAGE, "  ").unwrap();
-        assert_eq!(load_tmdb_language(&conn), crate::tmdb::DEFAULT_LANGUAGE);
+        assert_eq!(load_tmdb_language(&conn), crate::provider::tmdb::DEFAULT_LANGUAGE);
     }
 
     /// 新增供应方的 Key 也要能存能读（重启后不丢）
