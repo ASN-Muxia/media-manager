@@ -40,6 +40,18 @@ function exitSelecting(): void {
 }
 
 /**
+ * 滑动多选松手时**一次性**提交的结果。
+ *
+ * 滑动可以在非多选模式下发起（那是它最方便的用法），但选完若还停在普通模式，
+ * 勾选态就看不见 —— 所以有选中结果时顺手进入多选模式。
+ * 一条都没选到（比如只是长按后原地松手）就保持原样，不打扰。
+ */
+function onSelectMany(ids: number[]): void {
+  media.setSelected(ids);
+  if (ids.length) media.selecting = true;
+}
+
+/**
  * 重新识别存量数据的类型。
  *
  * 这是**修正历史误判**的入口：老版本只有一条判定规则，把大量剧集判成了电影。
@@ -311,6 +323,7 @@ onMounted(async () => {
         :selected="media.selected"
         @open="media.openDetail"
         @select="media.toggleSelect"
+        @select-many="onSelectMany"
       />
     </main>
 

@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   applyDragTo,
   beginDragSelection,
+  dragTrigger,
+  DRAG_THRESHOLD_PX,
+  EDGE_MAX_SPEED,
+  EDGE_ZONE_PX,
+  edgeScrollSpeed,
   finishDragSelection,
+  LONG_PRESS_MS,
   toggleOne,
 } from "./dragSelect";
 
@@ -98,5 +104,77 @@ describe("单点切换（复选框路径）", () => {
     const src = [1, 2];
     toggleOne(src, 3);
     expect(src).toEqual([1, 2]);
+  });
+});
+
+/* ==================== 触发判定 ==================== */
+/* 这一组是「滑动多选」最容易和页面滚动打架的地方，必须单独钉住。 */
+
+describe("dragTrigger 触发判定", () => {
+  it("鼠标：超过位移阈值就即时进入拖动", () => {
+    expect(dragTrigger("mouse", true, 0)).toBe("drag");
+    expect(dragTrigger("pen", true, 10)).toBe("drag");
+  });
+
+  it("位移阈值是个正数且不会大到吞掉正常拖动", () => {
+    expect(DRAG_THRESHOLD_PX).toBeGreaterThan(0);
+    expect(DRAG_THRESHOLD_PX).toBeLessThan(20);
+  });
+
+  it("鼠标：没超过阈值就是普通点击，不算拖动", () => {
+    expect(dragTrigger("mouse", false, 0)).toBe("wait");
+    // 按得再久也不该变成拖动 —— 桌面端不该有"长按"这个隐藏操作
+    expect(dragTrigger("mouse", false, 5000)).toBe("wait");
+  });
+
+  /** 触摸下"手指先动"就是想滚页面，绝不能抢成框选。 */
+  it("触摸：长按成立前先移动 → 判定为滚动，放弃", () => {
+    expect(dragTrigger("touch", true, 10)).toBe("abort");
+    expect(dragTrigger("touch", true, LONG_PRESS_MS - 1)).toBe("abort");
+  });
+
+  it("触摸：按住到时长且没移动 → 进入拖动", () => {
+    expect(dragTrigger("touch", false, LONG_PRESS_MS)).toBe("drag");
+    expect(dragTrigger("touch", false, LONG_PRESS_MS + 1)).toBe("drag");
+  });
+
+  it("触摸：还没到时长就继续等", () => {
+    expect(dragTrigger("touch", false, 0)).toBe("wait");
+    expect(dragTrigger("touch", false, LONG_PRESS_MS - 1)).toBe("wait");
+  });
+});
+
+describe("edgeScrollSpeed 贴边自动滚动", () => {
+  const TOP = 0;
+  const BOTTOM = 600;
+
+  it("不在边缘区时不滚", () => {
+    expect(edgeScrollSpeed(300, TOP, BOTTOM)).toBe(0);
+    expect(edgeScrollSpeed(EDGE_ZONE_PX, TOP, BOTTOM)).toBe(0);
+  });
+
+  it("靠近上边缘向上滚（负速度）", () => {
+    expect(edgeScrollSpeed(10, TOP, BOTTOM)).toBeLessThan(0);
+  });
+
+  it("靠近下边缘向下滚（正速度）", () => {
+    expect(edgeScrollSpeed(BOTTOM - 10, TOP, BOTTOM)).toBeGreaterThan(0);
+  });
+
+  it("越贴边越快", () => {
+    const near = Math.abs(edgeScrollSpeed(2, TOP, BOTTOM));
+    const far = Math.abs(edgeScrollSpeed(EDGE_ZONE_PX - 2, TOP, BOTTOM));
+    expect(near).toBeGreaterThan(far);
+  });
+
+  /** 拖出容器外面（距离 ≤ 0）应该取最大速度，否则选不到视野外的项。 */
+  it("指针跑出容器外时取最大速度", () => {
+    expect(Math.abs(edgeScrollSpeed(-20, TOP, BOTTOM))).toBe(EDGE_MAX_SPEED);
+    expect(Math.abs(edgeScrollSpeed(BOTTOM + 20, TOP, BOTTOM))).toBe(EDGE_MAX_SPEED);
+  });
+
+  it("上下同时不成立时优先上边缘（不会一次给出两个方向）", () => {
+    // 容器很矮，指针在中间：两个边缘区重叠，取上边缘（先判上）
+    expect(edgeScrollSpeed(5, 0, 10)).toBeLessThanOrEqual(0);
   });
 });

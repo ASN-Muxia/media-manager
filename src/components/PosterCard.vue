@@ -28,6 +28,7 @@ function onClick(): void {
   <button
     class="card"
     :class="{ picked: selected, selectable }"
+    :data-id="item.id"
     :title="selectable ? '点击勾选 / 取消勾选' : item.display_title"
     @click="onClick"
   >

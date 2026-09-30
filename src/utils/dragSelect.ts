@@ -96,3 +96,70 @@ export function toggleOne(selected: readonly number[], id: number): number[] {
   }
   return [...selected, id];
 }
+
+/* ==================== 触发判定与边缘滚动（纯计算，可单测） ==================== */
+/* 下面两个函数是「滑动多选」里最容易在改动中被悄悄改坏的部分：
+   一个是"这次按下到底算不算拖动"，一个是"贴边滚动该多快"。
+   它们只吃数字、只吐数字，所以能脱开 DOM 与计时器来验证。 */
+
+/** 超过这个位移（像素）才认为用户是在拖动，而不是手抖 / 点击。 */
+export const DRAG_THRESHOLD_PX = 6;
+/** 触摸下要按住这么久（毫秒）才进入滑动多选。 */
+export const LONG_PRESS_MS = 350;
+/** 距滚动容器上下边缘多少像素内开始自动滚动。 */
+export const EDGE_ZONE_PX = 56;
+/** 自动滚动的最大速度（像素 / 帧）。 */
+export const EDGE_MAX_SPEED = 16;
+
+/** 指针种类（与 `PointerEvent.pointerType` 对齐，这里只区分是否触摸）。 */
+export type PointerKind = "mouse" | "touch" | "pen";
+
+/**
+ * "这次按下到底算不算拖动"。
+ *
+ * - **鼠标 / 触控笔**：拖动**即时生效** —— 鼠标在卡片上拖不会和页面滚动打架，
+ *   等长按反而别扭。没超过阈值就还是普通点击。
+ * - **触摸**：必须**长按**到 `LONG_PRESS_MS` 且期间没怎么移动才进入；
+ *   一旦在长按成立前就移动了 —— 那是用户要滚页面，直接放弃（`abort`），
+ *   绝不能把滚动手势抢成框选。
+ *
+ * @param kind   指针种类
+ * @param moved  是否已超过 `DRAG_THRESHOLD_PX`
+ * @param heldMs 已按住多久
+ */
+export function dragTrigger(
+  kind: PointerKind,
+  moved: boolean,
+  heldMs: number,
+  longPressMs: number = LONG_PRESS_MS,
+): "drag" | "wait" | "abort" {
+  if (kind === "touch") {
+    if (moved) return "abort"; // 手指先动了 = 想滚页面
+    return heldMs >= longPressMs ? "drag" : "wait";
+  }
+  return moved ? "drag" : "wait";
+}
+
+/**
+ * 贴边自动滚动的速度：靠近上边缘返回负值（向上滚），靠近下边缘返回正值。
+ *
+ * `0` 表示不在边缘区、不用滚。速度按"贴得多近"线性加大，指针跑到容器外面
+ * （距离 ≤ 0）时取最大速度 —— 手指拖出界了也应该继续滚，否则选不到下面的项。
+ */
+export function edgeScrollSpeed(
+  pointerY: number,
+  top: number,
+  bottom: number,
+  zone: number = EDGE_ZONE_PX,
+  max: number = EDGE_MAX_SPEED,
+): number {
+  const up = speedAt(pointerY - top, zone, max);
+  if (up !== 0) return -up;
+  return speedAt(bottom - pointerY, zone, max);
+}
+
+function speedAt(distance: number, zone: number, max: number): number {
+  if (zone <= 0 || distance >= zone) return 0;
+  const ratio = (zone - Math.max(0, distance)) / zone; // 越贴边越接近 1
+  return Math.max(1, Math.round(max * ratio));
+}

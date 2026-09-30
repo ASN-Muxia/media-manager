@@ -248,6 +248,16 @@ export const useMediaStore = defineStore("media", () => {
   }
 
   /**
+   * 整批覆盖选中集合（滑动多选**松手时统一提交**走这里）。
+   *
+   * 与 `toggleSelect` 的区别：一次赋值、一次渲染、一次持久化，
+   * 不会在拖动过程中把外部状态改来改去 —— 拖动全程只改组件本地的预览集合。
+   */
+  function setSelected(ids: number[]): void {
+    selected.value = [...ids];
+  }
+
+  /**
    * 批量删除选中的条目。
    *
    * 后端一个事务删完并返回真实条数；这里据此提示，并刷新列表持久化状态。
@@ -589,7 +599,7 @@ export const useMediaStore = defineStore("media", () => {
     openDetail, closeDetail,
     scrape, scrapeMissing, cancelScrape, play, reveal, remove, clearAll,
     visibleItems, note,
-    isSelected, toggleSelect, toggleSelectAll, clearSelection, removeSelected,
+    isSelected, toggleSelect, toggleSelectAll, clearSelection, setSelected, removeSelected,
     importFolder, importFolderInto, removeEpisodes, loadCollections, reclassify,
     scrapeDouban,
   };
