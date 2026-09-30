@@ -45,8 +45,8 @@
 use crate::commands::catalog;
 use super::control::ScrapeControl;
 use crate::commands::settings::{
-    load_douban_config, load_fanart_key, load_hosts, load_llm_config, load_omdb_key,
-    load_tmdb_key, load_tmdb_language, load_tvdb_key,
+    load_auto_scrape, load_douban_config, load_fanart_key, load_hosts, load_llm_config,
+    load_omdb_key, load_tmdb_key, load_tmdb_language, load_tvdb_key,
 };
 use crate::store::db::now_epoch;
 use crate::provider::douban::{DoubanClient, DoubanMeta};
@@ -499,7 +499,7 @@ fn apply_douban_takeover(conn: &Connection, id: i64, m: &DoubanMeta) -> Result<D
              poster_path    = COALESCE(?6, poster_path), \
              vote_average   = COALESCE(?7, vote_average), \
              genre          = COALESCE(?8, genre), \
-             source         = ?9, \
+             source         = CASE WHEN source = 'manual' THEN source ELSE ?9 END, \
              updated_at     = ?10 \
          WHERE id = ?1",
         params![
@@ -1091,14 +1091,6 @@ pub async fn scrape_all(
                 .to_string(),
         });
     }
-    if control.running() {
-        return Ok(ScrapeStart {
-            started: false,
-            total: 0,
-            no_key: false,
-            message: "已有刮削任务在进行中".to_string(),
-        });
-    }
     let total = targets.len() as i64;
     if total == 0 {
         return Ok(ScrapeStart {
@@ -1110,7 +1102,15 @@ pub async fn scrape_all(
     }
 
     let control = control.inner().clone();
-    control.begin();
+    // 原子占位：与"扫描后自动刮削"共用一个开关，两边不会互相顶掉
+    if !control.try_begin() {
+        return Ok(ScrapeStart {
+            started: false,
+            total: 0,
+            no_key: false,
+            message: "已有刮削任务在进行中".to_string(),
+        });
+    }
     std::thread::spawn(move || {
         run_batch(app, control, key, hosts, language, targets);
     });
@@ -1172,6 +1172,101 @@ fn run_batch(
 pub fn cancel_scrape(control: State<'_, Arc<ScrapeControl>>) -> Result<bool, String> {
     control.request_cancel();
     Ok(control.running())
+}
+
+/* --------------------- 扫描 / 导入后的自动刮削 --------------------- */
+
+/// 一次自动刮削最多处理多少条（防止刚导入一个大库就发几十个请求出去）。
+const AUTO_SCRAPE_LIMIT: i64 = 50;
+
+/// 自动刮削的**纯决策**：要不要跑、跑哪些条目。
+///
+/// 抽成纯函数是为了能在不碰 `AppHandle` 的情况下单测"该不该触发"——
+/// 这类"多个开关叠加才生效"的逻辑最容易在改动中被悄悄破坏。
+///
+/// 全部不满足就返回 `None`（= 不触发）：
+/// - 开关没开；
+/// - 一个元数据源都没配（TMDb Key 与豆瓣开关都为空）→ 跑也白跑；
+/// - 没有待刮条目。
+fn plan_auto_scrape(
+    auto_on: bool,
+    tmdb_key: &str,
+    douban_on: bool,
+    targets: Vec<i64>,
+) -> Option<Vec<i64>> {
+    if !auto_on {
+        return None;
+    }
+    if tmdb_key.trim().is_empty() && !douban_on {
+        return None;
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    Some(targets)
+}
+
+/// 扫描 / 导入完成后自动刮削（设置项 `autoScrapeAfterScan` 控制，**默认关闭**）。
+///
+/// 设计要点：
+/// - **完全复用批量刮削那一套**：同一个 `ScrapeControl`、同一个后台线程、
+///   同一个 `scrape-progress` 事件。前端不需要为"自动"写第二套进度逻辑，
+///   「取消刮削」按钮对它同样有效。
+/// - **用 `try_begin` 而不是 `running()` + `begin()`**：手动任务在跑时直接放弃，
+///   绝不打断用户的显式操作（两步判断之间有窗口，会被自动触发插进去）。
+/// - **只挑还没海报的条目**：与「批量刮削」同一套目标选取，所以只会碰新导入的，
+///   已经刮好的不会被重刷。
+/// - **一个元数据源都没有就直接返回**：不要空跑一趟让用户看到莫名其妙的进度条。
+///
+/// 返回本次排入的条数；返回 `None` 表示"没有触发"（开关关闭 / 已有任务 /
+/// 没配任何源 / 没有待刮条目）。调用方据此决定要不要提示用户。
+pub fn maybe_auto_scrape(app: &AppHandle, control: &Arc<ScrapeControl>) -> Option<usize> {
+    // 排他占位：失败说明已有任务在跑，本次自动刮削放弃
+    if !control.try_begin() {
+        return None;
+    }
+
+    // 从这里开始已经占住控制权，任何提前返回都必须 finish()，否则会永远"运行中"
+    let plan = (|| -> Option<(String, Vec<String>, String, Vec<i64>)> {
+        let conn = crate::store::db::open(app).ok()?;
+        let auto_on = load_auto_scrape(&conn);
+        let key = load_tmdb_key(&conn);
+        let douban_on = load_douban_config(&conn).0;
+        // 开关没开就别费劲查目标了
+        if !auto_on {
+            return None;
+        }
+        let hosts = load_hosts(&conn);
+        let language = load_tmdb_language(&conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM media WHERE poster_path IS NULL OR poster_path = '' \
+                 ORDER BY id ASC LIMIT ?1",
+            )
+            .ok()?;
+        let rows = stmt.query_map(params![AUTO_SCRAPE_LIMIT], |r| r.get::<_, i64>(0)).ok()?;
+        let targets: Vec<i64> = rows.filter_map(Result::ok).collect();
+        let ids = plan_auto_scrape(auto_on, &key, douban_on, targets)?;
+        Some((key, hosts, language, ids))
+    })();
+
+    let Some((key, hosts, language, ids)) = plan else {
+        control.finish();
+        return None;
+    };
+
+    let total = ids.len();
+    let control = control.clone();
+    let app = app.clone();
+    // 提示用户"自动刮削开始了"：否则界面会突然冒出进度条，看着莫名其妙
+    let _ = app.emit(
+        PROGRESS_EVENT,
+        ScrapeProgress::tick(total as i64, 0, 0, 0, "扫描完成，自动刮削中…".to_string()),
+    );
+    std::thread::spawn(move || {
+        run_batch(app, control, key, hosts, language, ids);
+    });
+    Some(total)
 }
 
 /// 手动绑定某个 TMDB 条目（详情页「应用」按钮）。

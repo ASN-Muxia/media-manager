@@ -25,6 +25,8 @@ export const useSettingsStore = defineStore("settings", () => {
   const doubanEnabled = ref(false);
   /** 豆瓣 Cookie（可选）：带上登录态能降低被要求验证码的概率。 */
   const doubanCookie = ref("");
+  /** 扫描 / 导入完成后自动刮削（默认关闭）。 */
+  const autoScrapeAfterScan = ref(false);
 
   /* ---------------- 大模型（可选增强层，默认关闭） ---------------- */
   const llmEnabled = ref(false);
@@ -71,6 +73,7 @@ export const useSettingsStore = defineStore("settings", () => {
       omdbKey.value = s.omdbKey ?? "";
       doubanEnabled.value = Boolean(s.doubanEnabled);
       doubanCookie.value = s.doubanCookie ?? "";
+      autoScrapeAfterScan.value = Boolean(s.autoScrapeAfterScan);
       llmEnabled.value = Boolean(s.llmEnabled);
       llmBaseUrl.value = s.llmBaseUrl ?? "";
       llmApiKey.value = s.llmApiKey ?? "";
@@ -99,6 +102,7 @@ export const useSettingsStore = defineStore("settings", () => {
         omdbKey: omdbKey.value.trim(),
         doubanEnabled: doubanEnabled.value,
         doubanCookie: doubanCookie.value.trim(),
+        autoScrapeAfterScan: autoScrapeAfterScan.value,
         llmEnabled: llmEnabled.value,
         llmBaseUrl: llmBaseUrl.value.trim(),
         llmApiKey: llmApiKey.value.trim(),
@@ -135,7 +139,7 @@ export const useSettingsStore = defineStore("settings", () => {
   return {
     tmdbKey, mediaDirs, potPlayerPath, hostsText, tmdbLanguage, languageOptions,
     tvdbKey, fanartKey, omdbKey,
-    doubanEnabled, doubanCookie,
+    doubanEnabled, doubanCookie, autoScrapeAfterScan,
     llmEnabled, llmBaseUrl, llmApiKey, llmModel, llmVisionModel, llmVisionBaseUrl,
     loaded, saving, error,
     load, save, addDir, removeDir, hostsLines, applyLlmPreset,

@@ -12,7 +12,7 @@
 
 use crate::core::collection;
 use crate::commands::settings::load_media_dirs;
-use super::control::ScanControl;
+use super::control::{ScanControl, ScrapeControl};
 use crate::core::mediatype::{self, FolderEntry, FolderStat, MediaKind, Signals};
 use crate::core::parser::{parse_file_name, ParsedName};
 use crate::core::scanner::{self, ScanStats};
@@ -216,6 +216,7 @@ pub async fn scan_library(
     app: AppHandle,
     state: State<'_, Mutex<Connection>>,
     control: State<'_, Arc<ScanControl>>,
+    scrape: State<'_, Arc<ScrapeControl>>,
     roots: Option<Vec<String>>,
 ) -> Result<ScanStart, String> {
     let dirs = {
@@ -241,8 +242,9 @@ pub async fn scan_library(
     let root_count = dirs.len();
     let control = control.inner().clone();
     control.begin();
+    let scrape = scrape.inner().clone();
     std::thread::spawn(move || {
-        run_scan(app, control, dirs);
+        run_scan(app, control, scrape, dirs);
     });
 
     Ok(ScanStart {
@@ -252,7 +254,10 @@ pub async fn scan_library(
 }
 
 /// 后台扫描：先遍历目录（可取消），再入库（不可取消）。
-fn run_scan(app: AppHandle, control: Arc<ScanControl>, roots: Vec<String>) {
+///
+/// 入库完成后，如果用户在设置里开了「扫描后自动刮削」，会顺手把新条目
+/// 交给刮削链路（见 `scrape::maybe_auto_scrape`）；开关默认关闭。
+fn run_scan(app: AppHandle, control: Arc<ScanControl>, scrape: Arc<ScrapeControl>, roots: Vec<String>) {
     let emit = |p: ScanProgress| {
         let _ = app.emit(PROGRESS_EVENT, p);
     };
@@ -311,18 +316,25 @@ fn run_scan(app: AppHandle, control: Arc<ScanControl>, roots: Vec<String>) {
         true
     };
     match scanner::import_reported(&mut conn, &files, &roots, &mut tick) {
-        Ok(stats) => emit(ScanProgress::settled(
-            "完成",
-            format!(
+        Ok(stats) => {
+            let mut msg = format!(
                 "扫描完成：发现 {} 个视频（新增电影 {}、剧集 {}、单集 {}）",
                 stats.scanned, stats.added_movies, stats.added_series, stats.added_episodes
-            ),
-            false,
-            Some(stats),
-        )),
+            );
+            // 存量修复的解释要带上，否则用户只看到"跳过 N 个已存在"，以为什么都没做
+            if stats.repointed > 0 {
+                msg.push_str(&format!("，{} 集改挂到已存在的剧集", stats.repointed));
+            }
+            if stats.dropped_shells > 0 {
+                msg.push_str(&format!("，清理 {} 个空剧集条目", stats.dropped_shells));
+            }
+            emit(ScanProgress::settled("完成", msg, false, Some(stats)))
+        }
         Err(e) => emit(ScanProgress::settled("出错", format!("扫描失败：{e}"), false, None)),
     }
     control.finish();
+    // 扫描收尾后接自动刮削（开关关闭 / 没配源 / 已有任务时都是空操作）
+    crate::commands::scrape::maybe_auto_scrape(&app, &scrape);
 }
 
 /// 取消正在进行的扫描（仅在遍历目录阶段生效，入库阶段不中断）。
@@ -395,6 +407,14 @@ pub fn import_folder_sync(
     if stats.added_unknown > 0 {
         parts.push(format!("{0} 个待确认", stats.added_unknown));
     }
+    // 存量修复要**明说**：用户看到的是"跳过 25 个已存在"，如果不解释，
+    // 他会以为什么都没发生，而实际上单集刚刚被归到了正确的剧集下。
+    if stats.repointed > 0 {
+        parts.push(format!("{} 集改挂到已存在的剧集", stats.repointed));
+    }
+    if stats.dropped_shells > 0 {
+        parts.push(format!("清理 {} 个空剧集条目", stats.dropped_shells));
+    }
     if linked > 0 {
         parts.push(format!("归入栏目 {linked} 条"));
     }
@@ -453,9 +473,12 @@ fn link_imported_to_category(
 ///
 /// 与扫描同理：遍历 + 入库放到后台线程（`spawn_blocking`）并用自己的连接，
 /// 否则一个大目录会把主线程（界面）锁住几十秒。
+///
+/// 入库完成后，如果开了「扫描 / 导入后自动刮削」，新条目会自动交给刮削链路。
 #[tauri::command]
 pub async fn import_folder(
     app: AppHandle,
+    scrape: State<'_, Arc<ScrapeControl>>,
     path: String,
     category_id: Option<i64>,
 ) -> Result<ImportFolderResult, String> {
@@ -463,12 +486,21 @@ pub async fn import_folder(
     if path.is_empty() {
         return Err("请先选择要导入的文件夹".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut conn = crate::store::db::open(&app).map_err(|e| format!("打开数据库失败：{e}"))?;
+    let app_for_import = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut conn =
+            crate::store::db::open(&app_for_import).map_err(|e| format!("打开数据库失败：{e}"))?;
+        // 连接在闭包里 drop，自动刮削那边再自己开一个（WAL 下多连接是安全的）
         import_folder_sync(&mut conn, &path, category_id)
     })
     .await
-    .map_err(|e| format!("导入任务异常：{e}"))?
+    .map_err(|e| format!("导入任务异常：{e}"))??;
+
+    // 有新增才值得触发；开关关闭 / 已有任务时是空操作
+    if result.added > 0 {
+        crate::commands::scrape::maybe_auto_scrape(&app, scrape.inner());
+    }
+    Ok(result)
 }
 
 /// 列表筛选条件（全部可选，不传就是「不过滤」）。
@@ -639,8 +671,13 @@ fn clean_optional(raw: Option<String>) -> Option<String> {
 /// 手动新建资源的入库逻辑（校验 + INSERT），返回新行 id。
 ///
 /// 校验规则：名称去空格后非空；类型只能是 `movie` / `tv`；
-/// 流派 / 简介留空按 NULL 存。`source = 'manual'`、`group_key` 为空——
+/// 流派 / 简介留空按 NULL 存。`source = 'manual'` ——
 /// 重扫不会把它并掉，也不会给它凭空造单集。
+///
+/// **剧集要写 `group_key`**：`group_key` 是扫描器认剧集的主键，同一部剧的所有
+/// 目录都靠它归拢。手建行如果留空，就只能靠「标题逐字相等」这条兜底规则被认出来，
+/// 而扫描推出来的标题经常与用户手输的名字不完全一致（`西游记.1986.01.mkv` →
+/// `西游记 01`）—— 那样内容会另建一条剧集，手建的条目**永远**是空的。
 fn insert_manual_media(
     conn: &Connection,
     title: &str,
@@ -659,11 +696,14 @@ fn insert_manual_media(
     }
     let genre = clean_optional(genre);
     let overview = clean_optional(overview);
+    // 电影没有分组概念，留空；剧集用**原样的标题**当分组键——
+    // 扫描器的 `group_key` 是目录名原文，保持一致才能被「精确命中」那条规则直接找到。
+    let group_key: Option<&str> = if media_type == "tv" { Some(title) } else { None };
     conn.execute(
-        "INSERT INTO media (type, title, original_title, year, genre, overview, source, \
+        "INSERT INTO media (type, title, original_title, group_key, year, genre, overview, source, \
                             added_at, updated_at) \
-         VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'manual', ?6, ?6)",
-        params![media_type, title, year, genre, overview, ts],
+         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 'manual', ?7, ?7)",
+        params![media_type, title, group_key, year, genre, overview, ts],
     )
     .map_err(|e| format!("新建资源失败：{e}"))?;
     Ok(conn.last_insert_rowid())

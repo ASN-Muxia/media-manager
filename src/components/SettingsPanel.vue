@@ -343,6 +343,18 @@ async function onOpenDataDir(): Promise<void> {
         </label>
       </div>
       <div class="field">
+        <label class="switch">
+          <input v-model="store.autoScrapeAfterScan" type="checkbox" />
+          <span>扫描 / 导入完成后自动刮削</span>
+        </label>
+        <p class="panel-hint">
+          开启后，每次<strong>扫描媒体库</strong>或<strong>从文件夹导入</strong>结束，
+          系统会自动给<strong>还没有海报的条目</strong>跑一遍刮削（TMDb 优先，
+          豆瓣兜底）——只碰新条目，已经刮好的不会重刷，单次最多 50 条。
+          进度走同一个「刮削」提示，随时可以在设置页取消。
+        </p>
+      </div>
+      <div class="field">
         <label>豆瓣 Cookie（可选 · 可降低验证码概率）</label>
         <input
           v-model="store.doubanCookie"
@@ -367,7 +379,8 @@ async function onOpenDataDir(): Promise<void> {
       <p class="panel-hint split">
         <strong>使用提示</strong>：改完开关与 Cookie 记得先点最下方的「保存设置」。
         刮削入口仍在条目的详情页——「刮削」按钮会按 TMDb → 豆瓣的顺序自动跑完；
-        也可以在那里用豆瓣单独重刮一次。
+        也可以在那里用豆瓣单独重刮一次。「自动刮削」是<strong>可选</strong>的，
+        默认关闭；即使打开了，没开豆瓣、也没配 TMDb Key 时它会直接跳过，不会空跑。
       </p>
     </div>
 

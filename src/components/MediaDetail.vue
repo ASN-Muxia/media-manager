@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   getMediaCategories, getMediaTags, imageUrl, searchTmdb, setMediaCategories,
   setMediaTags, tmdbTitle, tmdbYear, tvdbApply,
@@ -8,6 +8,10 @@ import {
 import { useMediaStore } from "../stores/mediaStore";
 import { useCategoryStore } from "../stores/categoryStore";
 import { formatScore, typeIcon, typeLabel } from "../constants/mediaType";
+import {
+  applyDragTo, beginDragSelection, finishDragSelection, toggleOne,
+  type DragSelection,
+} from "../utils/dragSelect";
 
 const store = useMediaStore();
 const catStore = useCategoryStore();
@@ -25,9 +29,7 @@ function isEpSelected(id: number): boolean {
 }
 
 function toggleEp(id: number): void {
-  const i = epSelected.value.indexOf(id);
-  if (i >= 0) epSelected.value.splice(i, 1);
-  else epSelected.value.push(id);
+  epSelected.value = toggleOne(epSelected.value, id);
 }
 
 function toggleEpAll(): void {
@@ -35,6 +37,106 @@ function toggleEpAll(): void {
   epSelected.value =
     epSelected.value.length >= all.length && all.every(isEpSelected) ? [] : all;
 }
+
+/* ---------------- 拖动划过连续多选 ---------------- */
+/* 在某一行上按下并拖动：起点那一行决定本次是「选中」还是「取消选中」，
+   划过哪几行就作用到哪几行（框选一片 / 抹掉一片）。
+   状态机在 `utils/dragSelect.ts`，这里只负责接 DOM 事件。
+
+   事件用**列表容器上的委托**而不是每个 `<li>` 各挂一份：行是 `v-for` 出来的，
+   挂在容器上少一堆监听，也不会因为重渲染丢状态；`pointerup` 仍然挂在 document 上，
+   因为松手常常发生在列表之外。 */
+
+let dragState: DragSelection | null = null;
+const dragging = ref(false);
+
+/** 当前界面上可见的单集 id，按显示顺序：用于过滤掉已消失行的残留勾选。 */
+function visibleEpIds(): number[] {
+  return seasons.value.flatMap((s) => s.list.map((e) => e.id));
+}
+
+function syncFromDrag(): void {
+  if (!dragState) return;
+  epSelected.value = finishDragSelection(dragState, visibleEpIds());
+}
+
+/** 行内的可交互控件不该被拖动接管，否则复选框会被点两次。 */
+const EP_BLOCKED_SELECTOR = "button, input, label, a, select, textarea";
+
+/** 从 id 字符串反解出行号；拿不到（划过按钮、行间空隙）就返回 null。 */
+function rowIdOf(el: Element | null | undefined): number | null {
+  const raw = (el?.closest("li[data-ep-id]") as HTMLElement | null)?.dataset.epId;
+  if (!raw) return null;
+  const id = Number(raw);
+  return Number.isFinite(id) ? id : null;
+}
+
+/** 几何命中测试，仅触摸路径用；jsdom 没有布局引擎，取不到就算了。 */
+function elementAt(x: number, y: number): Element | null {
+  if (typeof document.elementFromPoint !== "function") return null;
+  try {
+    return document.elementFromPoint(x, y);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 取当前指针下的行。
+ *
+ * 鼠标走 `event.target`（事件委托，最快，也不依赖布局信息）；
+ * 触摸必须走几何命中 —— 浏览器对触摸有**隐式指针捕获**，
+ * 拖动期间 `event.target` 会一直停在起点那一行上，用它会把整段都算成第一行。
+ */
+function rowIdAt(ev: PointerEvent): number | null {
+  const el: Element | null =
+    ev.pointerType === "touch"
+      ? elementAt(ev.clientX, ev.clientY)
+      : (ev.target as Element | null);
+  return rowIdOf(el);
+}
+
+function onEpPointerDown(ev: PointerEvent, id: number): void {
+  if (ev.button !== 0) return;
+  const target = ev.target as Element | null;
+  if (target?.closest(EP_BLOCKED_SELECTOR)) return;
+  ev.preventDefault(); // 不然一路划过去会把标题选蓝 / 触发原生拖拽
+  dragState = beginDragSelection(epSelected.value, id);
+  dragging.value = true;
+  syncFromDrag();
+}
+
+function onEpPointerMove(ev: PointerEvent): void {
+  if (!dragState) return;
+  const id = rowIdAt(ev);
+  if (id === null) return;
+  // 幂等：同一行反复划过只写一次，只在真的变了时才刷新界面
+  if (applyDragTo(dragState, id)) syncFromDrag();
+}
+
+function endDrag(): void {
+  if (!dragState) return;
+  syncFromDrag();
+  dragState = null;
+  dragging.value = false;
+}
+
+/** 丢弃进行中的拖动（不提交）：换条目 / 卸载时用。 */
+function abortDrag(): void {
+  dragState = null;
+  dragging.value = false;
+}
+
+onMounted(() => {
+  document.addEventListener("pointerup", endDrag);
+  document.addEventListener("pointercancel", endDrag);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("pointerup", endDrag);
+  document.removeEventListener("pointercancel", endDrag);
+  abortDrag();
+});
 
 /**
  * 删除单集（单条或批量都走这里）。
@@ -95,22 +197,6 @@ const searching = ref(false);
 const results = ref<TmdbSearchItem[]>([]);
 const matchMsg = ref("");
 
-watch(
-  () => store.selectedId,
-  () => {
-    showMatch.value = false;
-    results.value = [];
-    q.value = "";
-    matchMsg.value = "";
-    tagInput.value = "";
-    catMsg.value = "";
-    // 换条目时清空单集勾选：上一个剧目的 id 不能带到下一个剧目
-    epSelected.value = [];
-    void loadClassification();
-  },
-  { immediate: true },
-);
-
 /* ---------------- 分类与标签 ---------------- */
 /* 一条影视可以属于多个分类（多对多），也可以有多个标签。
    分类改动会立刻反映到左侧导航，标签则用于筛选。 */
@@ -135,6 +221,34 @@ async function loadClassification(): Promise<void> {
     myTags.value = [];
   }
 }
+
+/**
+ * 换条目时的重置钩子。
+ *
+ * ⚠️ 这段**必须放在所有被它引用的状态之后**：`immediate: true` 会在 setup
+ * 期间同步执行一次回调，如果 `tagInput` / `catMsg` 还处在 TDZ 里，回调会在
+ * 第一行引用它们时直接抛错 —— 而 Vue 只把错误吞进告警，后面几行（清空勾选、
+ * 丢弃拖动、加载分类）就**静默不执行**了。这不是小事：单集勾选会跨剧目残留，
+ * 删一条剧目的选集时可能删到另一部剧的集。
+ *
+ * 清空单集勾选是硬约定：上一个剧目的 id 不能带到下一个剧目，
+ * 与列表中「切换视图必须清空多选」是同一条安全规则。
+ */
+watch(
+  () => store.selectedId,
+  () => {
+    showMatch.value = false;
+    results.value = [];
+    q.value = "";
+    matchMsg.value = "";
+    tagInput.value = "";
+    catMsg.value = "";
+    abortDrag();
+    epSelected.value = [];
+    void loadClassification();
+  },
+  { immediate: true },
+);
 
 function hasCategory(id: number): boolean {
   return myCategories.value.some((c) => c.id === id);
@@ -364,7 +478,13 @@ function pick(it: TmdbSearchItem): void {
       </ul>
     </section>
 
-    <section v-if="seasons.length" class="episodes">
+    <section
+      v-if="seasons.length"
+      class="episodes"
+      :class="{ dragging }"
+      @pointerover="onEpPointerMove"
+      @pointermove="onEpPointerMove"
+    >
       <div class="ep-bar">
         <span class="ep-count">
           共 {{ detail.media.episode_count }} 条资源<template v-if="epSelected.length">
@@ -382,11 +502,18 @@ function pick(it: TmdbSearchItem): void {
           删除所选
         </button>
       </div>
+      <p class="ep-tip">提示：在某一行上按住拖动可连续勾选（起点已选中则连续取消）</p>
 
       <div v-for="s in seasons" :key="s.season" class="season">
         <h3>第 {{ s.season }} 季</h3>
         <ul>
-          <li v-for="e in s.list" :key="e.id" :class="{ picked: isEpSelected(e.id) }">
+          <li
+            v-for="e in s.list"
+            :key="e.id"
+            :data-ep-id="e.id"
+            :class="{ picked: isEpSelected(e.id) }"
+            @pointerdown="onEpPointerDown($event, e.id)"
+          >
             <label class="ep-check">
               <input
                 type="checkbox"
@@ -505,10 +632,15 @@ h2 { margin: 0; font-size: var(--fs-24); line-height: 1.25; }
   border-radius: var(--radius-s); background: var(--surface); border: 1px solid var(--border);
 }
 .ep-count { flex: 1; font-size: var(--fs-13); color: var(--text-2); }
+.ep-tip { margin: 0; font-size: var(--fs-12); color: var(--muted); }
 .ep-check { flex: none; display: flex; align-items: center; }
 .ep-check input { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
 /* 勾上的行给个底纹，避免看不出选了哪些 */
 .season li.picked { background: var(--accent-soft); }
+/* 拖动划过期间禁掉文字选择：否则一路划过去会把标题选蓝。
+   （按下时已 preventDefault，这里只是兜底与视觉提示。） */
+.episodes.dragging { user-select: none; cursor: default; }
+.episodes.dragging .season li { cursor: default; }
 
 .episodes { display: flex; flex-direction: column; gap: calc(var(--space) * 5); }
 .episodes.empty { color: var(--muted); font-size: var(--fs-13); }

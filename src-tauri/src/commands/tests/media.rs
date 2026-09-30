@@ -760,3 +760,290 @@ fn movie_collections_keep_unrelated_movies_apart() {
     assert_eq!(got.len(), 1, "1917 不该自成合集，也不该并进沙丘");
     assert_eq!(got[0].movies.len(), 2);
 }
+
+/* ==================== 手建剧集接不进内容（回归） ==================== */
+/* 场景：用户先「新建剧集 西游记」，再导入西游记内容，内容必须并进这一条。
+   历史 bug 是它会另建一条剧集，且此后**永远**并不过来 —— 所以这里既要验
+   "新导入能并进入"，也要验"已经坏掉的老数据重新导入能自愈"。 */
+
+fn touch_files(dir: &std::path::Path, rels: &[String]) {
+    for rel in rels {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"dummy").unwrap();
+    }
+}
+
+fn scene_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("mm-{tag}-{}-{}", std::process::id(), now_ns()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn row(conn: &Connection, id: i64) -> (String, String, Option<String>) {
+    conn.query_row(
+        "SELECT title, type, group_key FROM media WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .unwrap()
+}
+
+fn episodes_of(conn: &Connection, media_id: i64) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM episodes WHERE media_id = ?1",
+        params![media_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// 核心回归：`西游记.1986.01.mkv` 解析出的标题是「西游记 01」（尾部编号不算集号），
+/// 与手建的「西游记」**不完全相等**。归一化后两者相同，必须并入同一条。
+#[test]
+fn manual_series_receives_content_with_mismatched_title() {
+    let dir = scene_dir("xyj-mismatch");
+    touch_files(
+        &dir,
+        &(1..=25)
+            .map(|n| format!("西游记/西游记.1986.{n:02}.mkv"))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut conn = memory_db();
+    let ts = db::now_epoch();
+    let manual = insert_manual_media(&conn, "西游记", "tv", None, None, None, ts).unwrap();
+    assert_eq!(
+        row(&conn, manual).2.as_deref(),
+        Some("西游记"),
+        "手建剧集要带上分组键，否则只能靠标题逐字比对"
+    );
+
+    let res = import_folder_sync(&mut conn, &dir.to_string_lossy(), None).unwrap();
+    assert_eq!(res.added, 25, "25 个文件都应入库：{res:?}");
+
+    let series: i64 = conn
+        .query_row("SELECT COUNT(*) FROM media WHERE type='tv'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(series, 1, "只能有一条剧集，不能另建『西游记 01』");
+    assert_eq!(episodes_of(&conn, manual), 25, "25 集都要挂到手建的剧集下");
+    assert_eq!(row(&conn, manual).0, "西游记", "用户起的名字不能被改成『西游记 01』");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 多种命名形状都要能并进来（第N集 / EP / 季目录 / CCTV 后缀…）。
+#[test]
+fn manual_series_absorbs_common_naming_shapes() {
+    let shapes: &[&str] = &[
+        "西游记/西游记.S01E{n:02}.1080p.mkv",
+        "西游记/西游记.E{n:02}.mkv",
+        "西游记/西游记.第{n:02}集.1080p.mkv",
+        "西游记/第一季/西游记.第{n:02}集.mkv",
+        "西游记/西游记.{n:02}.mkv",
+        "西游记/西游记.EP{n:02}.mkv",
+        "西游记/西游记.1986.CCTV.{n:02}.mkv",
+        "西游记/西游记.第{n:02}話.mkv",
+    ];
+    for shape in shapes {
+        let dir = scene_dir("xyj-shape");
+        touch_files(
+            &dir,
+            &(1..=25)
+                .map(|n| shape.replace("{n:02}", &format!("{n:02}")))
+                .collect::<Vec<_>>(),
+        );
+        let mut conn = memory_db();
+        let ts = db::now_epoch();
+        let manual = insert_manual_media(&conn, "西游记", "tv", None, None, None, ts).unwrap();
+        import_folder_sync(&mut conn, &dir.to_string_lossy(), None).unwrap();
+
+        assert_eq!(
+            episodes_of(&conn, manual),
+            25,
+            "命名形状 {shape} 应全部并入手建剧集"
+        );
+        let series: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media WHERE type='tv'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(series, 1, "命名形状 {shape} 不该另建剧集");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// 存量修复：库里已经是「空的『西游记』 + 装着 25 集的『西游记 01』」，
+/// 重新导入一次就应把单集改挂过去，并清掉那个空壳。
+///
+/// 构造方式：**先**导入（此时没有手建行，自然生成自动剧集，路径与扫描器一致），
+/// **再**补一条 group_key 为空的手建行 —— 这正是老代码下的历史状态。
+#[test]
+fn broken_manual_series_is_repaired_on_reimport() {
+    let dir = scene_dir("xyj-repair");
+    touch_files(
+        &dir,
+        &(1..=25)
+            .map(|n| format!("西游记/西游记.1986.{n:02}.mkv"))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut conn = memory_db();
+    let root = dir.to_string_lossy().to_string();
+    // 第一次导入：没有手建行，会生成自动剧集「西游记 01」
+    import_folder_sync(&mut conn, &root, None).unwrap();
+    let orphan: i64 = conn
+        .query_row(
+            "SELECT id FROM media WHERE type='tv' ORDER BY id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(episodes_of(&conn, orphan), 25, "先造出『单集挂在自动行上』的现场");
+
+    // 再补一条手建行（group_key 为空 = 老代码建出来的样子）
+    let ts = db::now_epoch();
+    conn.execute(
+        "INSERT INTO media (type,title,original_title,source,added_at,updated_at) \
+         VALUES ('tv','西游记','西游记','manual',?1,?1)",
+        params![ts],
+    )
+    .unwrap();
+    let manual = conn.last_insert_rowid();
+    assert_eq!(episodes_of(&conn, manual), 0);
+    assert_eq!(episodes_of(&conn, orphan), 25);
+
+    let res = import_folder_sync(&mut conn, &root, None).unwrap();
+
+    assert_eq!(res.added, 0, "文件都已存在，不该重复入库：{res:?}");
+    assert_eq!(res.skipped, 25, "25 个都该被识别为已存在：{res:?}");
+    assert_eq!(episodes_of(&conn, manual), 25, "单集应改挂到手建剧集");
+    assert_eq!(episodes_of(&conn, orphan), 0, "原父行不该再持有单集");
+    let left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media WHERE id = ?1",
+            params![orphan],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "被搬空的重复剧集行应被清掉");
+    assert!(
+        res.message.contains("改挂"),
+        "提示要说清楚发生了什么：{}",
+        res.message
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 空壳清理的守卫：只要那行**有一点东西**（有元数据 / 被锁定 / 是手建的），
+/// 就一律保留 —— 宁可留个多余条目，也不能误删用户数据。
+#[test]
+fn shell_cleanup_is_strictly_guarded() {
+    let conn = memory_db();
+    let ts = db::now_epoch();
+    let mk = |extra_col: &str, extra_val: &str| -> i64 {
+        let sql = format!(
+            "INSERT INTO media (type,title,group_key,{extra_col},added_at,updated_at) \
+             VALUES ('tv','X','gk','{extra_val}',?1,?1)"
+        );
+        conn.execute(&sql, params![ts]).unwrap();
+        conn.last_insert_rowid()
+    };
+    let _plain = mk("source", "auto");
+    let scraped = mk("poster_path", "p.jpg");
+    let locked = mk("locked", "1");
+    conn.execute(
+        "INSERT INTO media (type,title,group_key,source,added_at,updated_at) \
+         VALUES ('tv','Y','gk','manual',?1,?1)",
+        params![ts],
+    )
+    .unwrap();
+    let manual = conn.last_insert_rowid();
+    // 给 plain 之外的三个各挂一集，证明"有单集就不删"
+    for id in [scraped, locked, manual] {
+        conn.execute(
+            "INSERT INTO episodes (media_id,season,episode,file_path,added_at) \
+             VALUES (?1,1,1,?2,?3)",
+            params![id, format!("E{id}.mkv"), ts],
+        )
+        .unwrap();
+    }
+
+    let dropped = crate::core::scanner::drop_empty_series_shells(&conn, "gk").unwrap();
+    assert_eq!(dropped, 1, "只有真正空壳的那一行该被删");
+    let survivors: Vec<i64> = conn
+        .prepare("SELECT id FROM media ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(survivors, vec![scraped, locked, manual], "其余行必须原样保留");
+}
+
+/// 年份守卫：手建剧集填了年份时，不同年份的同名内容不应被并进去。
+///
+/// 注意目录名故意与手建标题不同（`西游记 2010` vs `西游记`），这样
+/// `group_key` 精确命中那条规则不生效，年份守卫才是唯一的判据。
+/// （目录名**恰好**与手建标题相同时会走 `group_key` 精确命中——
+/// 那是更强的归属证据，优先于年份提示。）
+#[test]
+fn manual_series_year_guard_blocks_conflicting_year() {
+    let dir = scene_dir("xyj-year");
+    touch_files(&dir, &["西游记 2010/西游记.2010.E01.mkv".to_string()]);
+
+    let mut conn = memory_db();
+    let ts = db::now_epoch();
+    // 用户建的是 1986 版
+    let manual =
+        insert_manual_media(&conn, "西游记", "tv", Some(1986), None, None, ts).unwrap();
+    import_folder_sync(&mut conn, &dir.to_string_lossy(), None).unwrap();
+
+    assert_eq!(
+        episodes_of(&conn, manual),
+        0,
+        "年份冲突（1986 vs 2010）时不该并进去"
+    );
+    // 它应该照常建自己的条目
+    let others: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media WHERE id <> ?1",
+            params![manual],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(others, 1, "2010 版应另立一条");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 手建的电影不该被写分组键（电影没有"同一部剧聚合"的概念）。
+#[test]
+fn manual_movie_has_no_group_key() {
+    let conn = memory_db();
+    let id = insert_manual_media(&conn, "沙丘", "movie", Some(2021), None, None, 1).unwrap();
+    let (_, kind, gk) = row(&conn, id);
+    assert_eq!(kind, "movie");
+    assert_eq!(gk, None, "电影不该有分组键");
+}
+
+/// 手建一个不相干的剧集，不该把别的剧的内容吸走。
+#[test]
+fn unrelated_manual_series_does_not_swallow_other_shows() {
+    let dir = scene_dir("xyj-unrelated");
+    touch_files(&dir, &["大明风华/大明风华.S01E01.mkv".to_string()]);
+
+    let mut conn = memory_db();
+    let ts = db::now_epoch();
+    let manual = insert_manual_media(&conn, "西游记", "tv", None, None, None, ts).unwrap();
+    import_folder_sync(&mut conn, &dir.to_string_lossy(), None).unwrap();
+
+    assert_eq!(episodes_of(&conn, manual), 0, "不相干的剧集不该被吸进手建条目");
+    let other: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media WHERE title LIKE '大明风华%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(other, 1, "它应该照常建自己的剧集");
+    std::fs::remove_dir_all(&dir).ok();
+}

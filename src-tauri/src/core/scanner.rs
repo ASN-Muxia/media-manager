@@ -28,6 +28,13 @@ pub struct ScanStats {
     /// 证据不足、标成「待确认」的文件数（见 `mediatype` 的 Unknown 默认策略）。
     pub unknown: usize,
     pub added_unknown: usize,
+    /// 已入库但**挂错父行**、本次改挂到目标剧集的单集数。
+    ///
+    /// 存量修复用：手建剧集早期接不进内容，文件都挂到了自动建的同名行上；
+    /// 重新导入时光靠 `ON CONFLICT DO NOTHING` 是纠不回来的。
+    pub repointed: usize,
+    /// 清掉的「空壳」剧集行数（无单集、无元数据、非手建的重复行）。
+    pub dropped_shells: usize,
 }
 
 /// 一个待入库的视频文件。
@@ -329,20 +336,92 @@ fn summarize_roots(roots: &[String]) -> String {
     }
 }
 
+/// 手建剧集的查找（**归一化标题**匹配）。
+///
+/// 为什么手建行不能靠 `group_key` 找：`group_key` 是**目录名派生**的，而手建剧集
+/// 没有目录，两者天然对不上。所以手建行只能靠标题匹配。
+///
+/// 为什么不能逐字比较标题：扫描推出来的标题经常多带一段没被识别成集号的数字
+/// （`西游记.1986.01.mkv` → `西游记 01`，因为 `01` 这种短编号被有意排除在
+/// 「集号」之外，以免把 `Rocky 2` 当成剧集）。逐字比较会让手建条目**永远**
+/// 接不进内容 —— 这正是「新建了《西游记》却始终导入不进去」的根因。
+/// 用 `normalize_title` 抹掉尾部编号后比较，两种写法就能对上。
+///
+/// 年份守卫：两边都有年份且不一致时**不匹配**，避免把不同年份的两版并到一起
+/// （用户没填年份是常态，所以只有双方都有值时才校验）。
+///
+/// 命中范围是「用户拥有」的行：`source = 'manual'`（手建）**或** `locked = 1`
+/// （用户编辑过）。只看 `source` 不够——刮削可能改写 `source` 的取值，
+/// 用户手动改过名的自动行也应该继续接住后续导入。
+fn find_manual_series(
+    conn: &Connection,
+    title: &str,
+    year: Option<i32>,
+) -> Result<Option<(i64, bool)>, String> {
+    let want = grouping::normalize_title(title);
+    if want.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, original_title, group_key IS NULL, year FROM media \
+             WHERE type = 'tv' \
+               AND (source = 'manual' OR COALESCE(locked, 0) = 1) ORDER BY id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, bool>(3)?,
+                r.get::<_, Option<i32>>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows {
+        let (id, name, orig, no_key, my_year) = row.map_err(|e| e.to_string())?;
+        let hit = grouping::normalize_title(&name) == want
+            || orig
+                .as_deref()
+                .map(|o| grouping::normalize_title(o) == want)
+                .unwrap_or(false);
+        if !hit {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (my_year, year) {
+            if a != b {
+                continue;
+            }
+        }
+        return Ok(Some((id, no_key)));
+    }
+    Ok(None)
+}
+
 /// 剧集分组查找。
 ///
-/// 匹配优先级：
-/// 1. `group_key` 精确命中（同一目录下的同一部剧）；
-/// 2. 退回 `title`/`original_title`，**仅匹配 `group_key` 仍为空的老数据**——
+/// 匹配优先级（从高到低）：
+/// 1. **手建剧集**（`source = 'manual'`）按归一化标题命中 —— 用户亲手建的条目
+///    就是他想要的目标，优先级最高；
+/// 2. `group_key` 精确命中（同一目录下的同一部剧）；
+/// 3. 退回标题逐字相等，**仅匹配 `group_key` 仍为空的老数据**——
 ///    这样既能兼容升级前建的行，又不会把两部同名但不同目录的剧集并成一条。
 ///
-/// `title` 之所以还要参与匹配：刮削会把显示标题改成 TMDB 标题，`original_title`
-/// 保留扫描时的原始标题，是稳定的兜底键。
+/// 返回值第二项表示是否需要把 `group_key` 补上（自愈）。
 fn find_series_id(
     conn: &Connection,
     group_key: &str,
     title: &str,
+    year: Option<i32>,
 ) -> Result<Option<(i64, bool)>, String> {
+    // 1) 手建剧集优先
+    if let Some(hit) = find_manual_series(conn, title, year)? {
+        return Ok(Some(hit));
+    }
+    // 2) group_key 精确命中 / 3) 老数据的标题兜底
     conn.query_row(
         "SELECT id, group_key IS NULL FROM media WHERE type = 'tv' AND ( \
              group_key = ?1 \
@@ -388,9 +467,9 @@ pub(crate) fn upsert_series(
     year: Option<i32>,
     ts: i64,
 ) -> Result<(i64, bool), String> {
-    if let Some((id, needs_heal)) = find_series_id(conn, group_key, title)? {
+    if let Some((id, needs_heal)) = find_series_id(conn, group_key, title, year)? {
         if needs_heal {
-            // 老库升级上来的行没有分组键，顺手补上（自愈）
+            // 没有分组键的行（手建的新条目 / 老库升级上来的行）顺手补上（自愈）
             conn.execute(
                 "UPDATE media SET group_key = ?2 WHERE id = ?1",
                 params![id, group_key],
@@ -443,7 +522,66 @@ pub(crate) fn insert_episode(
     Ok(n > 0)
 }
 
-/// 把收集到的文件写入数据库（单事务），并记录 scan_history。
+/// 这一行是不是用户手建的剧集（`source = 'manual'`）。
+fn is_manual_series(conn: &Connection, media_id: i64) -> Result<bool, String> {
+    let src: Option<String> = conn
+        .query_row(
+            "SELECT source FROM media WHERE id = ?1",
+            params![media_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    Ok(src.as_deref() == Some("manual"))
+}
+
+/// 把已入库、但挂在**别的**剧集下的单集改挂到目标剧集。
+///
+/// 这是「手建剧集接不进内容」那个历史 bug 的**存量修复**：文件早就以错误的父行
+/// 入库了，重新导入时 `ON CONFLICT(file_path) DO NOTHING` 只会跳过，
+/// 父行永远纠正不过来。补上这一句，用户不必删库重扫。
+///
+/// 只在目标行是**手建剧集**时才调用——那是用户明确指定的归属，改挂不会有歧义；
+/// 自动分组的结果一律不动，避免把正常条目搬来搬去。
+fn repoint_episode(conn: &Connection, media_id: i64, path: &str) -> Result<bool, String> {
+    let n = conn
+        .execute(
+            "UPDATE episodes SET media_id = ?2 WHERE file_path = ?1 AND media_id <> ?2",
+            params![path, media_id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// 清掉「空壳」重复剧集行。
+///
+/// 历史 bug 会在手建剧集之外多造一条同名行；单集改挂回去之后，那条行只剩空壳。
+/// 只在**能证明它是空壳**时才删：非手建、未锁定、没有任何元数据、名下一条单集
+/// 都没有。任何一样不满足就原样保留（宁可留个多余条目，也不能误删用户的数据）。
+pub(crate) fn drop_empty_series_shells(conn: &Connection, group_key: &str) -> Result<usize, String> {
+    let ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM media WHERE type = 'tv' AND group_key = ?1 \
+                   AND COALESCE(source, '') <> 'manual' AND COALESCE(locked, 0) = 0 \
+                   AND tmdb_id IS NULL AND tvdb_id IS NULL \
+                   AND COALESCE(poster_path, '') = '' AND COALESCE(backdrop_path, '') = '' \
+                   AND COALESCE(overview, '') = '' \
+                   AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.media_id = media.id)",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![group_key], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    for id in &ids {
+        conn.execute("DELETE FROM media WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(ids.len())
+}
 ///
 /// 命令侧走带进度回报的 `import_reported`，这个无回报的入口留给单测。
 #[allow(dead_code)]
@@ -490,6 +628,8 @@ pub fn import_reported(
 
     // 剧集按（标题）聚合：BTreeMap 保证处理顺序稳定
     let mut series_cache: BTreeMap<String, i64> = BTreeMap::new();
+    // 发生过「单集改挂」的分组键：只有这些分组才需要清理空壳行。
+    let mut healed_groups: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     let mut processed = 0usize;
     let mut reported_at = 0usize;
@@ -530,6 +670,16 @@ pub fn import_reported(
                 Ok(false) => {
                     stats.episodes += 1;
                     stats.skipped += 1;
+                    // 文件已入库但**挂在别的剧集下**：如果目标行是用户手建的条目，
+                    // 说明这是「手建剧集接不进内容」的存量数据，改挂过来。
+                    // （自动分组的结果一律不动，避免把正常条目搬来搬去。）
+                    if is_manual_series(&tx, media_id).unwrap_or(false) {
+                        let path = f.path.to_string_lossy().to_string();
+                        if repoint_episode(&tx, media_id, &path).unwrap_or(false) {
+                            stats.repointed += 1;
+                            healed_groups.insert(group_key.clone());
+                        }
+                    }
                 }
                 Err(_) => stats.failed += 1,
             }
@@ -559,6 +709,12 @@ pub fn import_reported(
             }
         }
     }
+
+    // 单集改挂完成后，那些被搬空的重复剧集行只剩空壳，清掉（严格证明才删）
+    for gk in &healed_groups {
+        stats.dropped_shells += drop_empty_series_shells(&tx, gk)?;
+    }
+    stats.series = stats.series.saturating_sub(stats.dropped_shells);
 
     tx.commit().map_err(|e| e.to_string())?;
 

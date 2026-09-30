@@ -20,9 +20,29 @@ pub struct TaskControl {
 
 impl TaskControl {
     /// 开始新一轮：先复位取消标志，再置运行中。
+    ///
+    /// 会**无条件**抢占。自动化触发请改用 [`try_begin`]，避免把用户正在跑的
+    /// 任务顶掉。
     pub fn begin(&self) {
         self.cancel.store(false, Ordering::SeqCst);
         self.running.store(true, Ordering::SeqCst);
+    }
+
+    /// 尝试开始：已经在跑就返回 `false` 且**不动**当前任务。
+    ///
+    /// 用 `compare_exchange` 而不是「先 `running()` 再 `begin()`」：后者两步之间
+    /// 有窗口，自动触发可能正好插进用户手动启动的任务里，把它的取消标志清掉。
+    pub fn try_begin(&self) -> bool {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.cancel.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn finish(&self) {
@@ -91,5 +111,22 @@ mod tests {
         assert!(c.cancelled());
         c.begin();
         assert!(!c.cancelled());
+    }
+
+    /// 自动触发不能让用户正在跑的任务被打断。
+    #[test]
+    fn try_begin_refuses_while_running() {
+        let c = ScrapeControl::default();
+        assert!(c.try_begin(), "空闲时应该能开始");
+        assert!(c.running());
+
+        c.request_cancel();
+        assert!(!c.try_begin(), "已在运行时必须拒绝");
+        assert!(c.cancelled(), "拒绝时不能把用户任务的取消标志清掉");
+        assert!(c.running());
+
+        c.finish();
+        assert!(c.try_begin(), "上一轮结束后应能再次开始");
+        assert!(!c.cancelled(), "新一轮要清掉上一轮的取消标志");
     }
 }

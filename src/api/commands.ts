@@ -150,6 +150,11 @@ export interface Settings {
   doubanEnabled: boolean;
   /** 豆瓣 Cookie（可选，带登录态可降低验证码概率） */
   doubanCookie: string;
+  /**
+   * 扫描 / 导入完成后自动为**还没有海报**的条目跑一遍刮削（默认关闭）。
+   * 开启后仍受 TMDb / 豆瓣各自开关约束；没配 TMDb Key 时豆瓣承担主要工作。
+   */
+  autoScrapeAfterScan: boolean;
   /** 大模型脏文件名解析总开关（**可选增强层**，默认关闭） */
   llmEnabled: boolean;
   llmBaseUrl: string;

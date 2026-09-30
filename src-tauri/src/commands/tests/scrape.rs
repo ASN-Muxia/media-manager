@@ -548,3 +548,65 @@ fn pending_file_name_falls_back_to_first_episode() {
     let pending = read_pending(&conn, id).unwrap();
     assert_eq!(pending.file_name.as_deref(), Some("S01E01.mkv"));
 }
+
+/* --------------------- 扫描 / 导入后的自动刮削 --------------------- */
+
+/// 自动刮削的纯决策：多个开关叠加才生效，任一条件不满足就**不触发**。
+#[test]
+fn auto_scrape_requires_switch_and_at_least_one_source() {
+    let targets = vec![1i64, 2, 3];
+
+    // 开关没开 → 不触发（哪怕源和条目都齐）
+    assert_eq!(plan_auto_scrape(false, "k", true, targets.clone()), None);
+
+    // 开了但一个源都没配 → 不触发，别空跑
+    assert_eq!(plan_auto_scrape(true, "", false, targets.clone()), None);
+    assert_eq!(plan_auto_scrape(true, "   ", false, targets.clone()), None);
+
+    // 没有待刮条目 → 不触发
+    assert_eq!(plan_auto_scrape(true, "k", false, Vec::new()), None);
+
+    // 有 TMDb Key 就够
+    assert_eq!(
+        plan_auto_scrape(true, "k", false, targets.clone()),
+        Some(targets.clone())
+    );
+    // 只开豆瓣也行（没配 TMDb Key 时豆瓣承担主要工作）
+    assert_eq!(
+        plan_auto_scrape(true, "", true, targets.clone()),
+        Some(targets.clone())
+    );
+    // 两个都配更好
+    assert_eq!(plan_auto_scrape(true, "k", true, targets.clone()), Some(targets));
+}
+
+/// 自动刮削开关的持久化：默认关闭，存取往返要对得上。
+#[test]
+fn auto_scrape_setting_defaults_off_and_roundtrips() {
+    let conn = memory_db();
+    assert!(
+        !crate::commands::settings::load_auto_scrape(&conn),
+        "默认必须关闭：自动往第三方站点发请求要用户显式同意"
+    );
+    put_setting(&conn, "autoScrapeAfterScan", "1");
+    assert!(crate::commands::settings::load_auto_scrape(&conn));
+    put_setting(&conn, "autoScrapeAfterScan", "true");
+    assert!(crate::commands::settings::load_auto_scrape(&conn), "true 也要认");
+    put_setting(&conn, "autoScrapeAfterScan", "0");
+    assert!(!crate::commands::settings::load_auto_scrape(&conn));
+}
+
+/// 自动刮削与手动刮削共用同一个开关：已占用时自动触发必须放弃，
+/// 且**不能**清掉手动任务的取消标志（否则用户点了取消会被悄悄复活）。
+#[test]
+fn auto_scrape_yields_to_a_running_manual_task() {
+    let control = new_control();
+    // 模拟用户手动启动的批量刮削
+    assert!(control.try_begin());
+    control.request_cancel();
+
+    // 自动触发这时不能插进去
+    assert!(!control.try_begin(), "手动任务在跑时必须让路");
+    assert!(control.cancelled(), "不能把用户点的取消给清掉");
+    assert!(control.running());
+}

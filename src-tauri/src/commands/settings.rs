@@ -18,6 +18,8 @@ const KEY_FANART_KEY: &str = "fanartKey";
 const KEY_OMDB_KEY: &str = "omdbKey";
 const KEY_DOUBAN_ENABLED: &str = "doubanEnabled";
 const KEY_DOUBAN_COOKIE: &str = "doubanCookie";
+/// 扫描 / 导入完成后自动刮削（豆瓣兜底那条链）。
+const KEY_AUTO_SCRAPE: &str = "autoScrapeAfterScan";
 const KEY_LLM_ENABLED: &str = "llmEnabled";
 const KEY_LLM_BASE_URL: &str = "llmBaseUrl";
 const KEY_LLM_API_KEY: &str = "llmApiKey";
@@ -60,6 +62,13 @@ pub struct Settings {
     /// 留空也能用（匿名请求受到更严格的限流）。
     #[serde(default)]
     pub douban_cookie: String,
+    /// 扫描 / 导入完成后，自动为**还没有海报**的条目跑一遍刮削。
+    ///
+    /// 默认关闭：自动往第三方站点发请求应该由用户显式同意。
+    /// 开启后仍受 `doubanEnabled` 等各 provider 开关约束——没配 TMDb Key
+    /// 也能跑，此时豆瓣会承担主要工作。
+    #[serde(default)]
+    pub auto_scrape_after_scan: bool,
     /// 大模型脏文件名解析总开关（关掉就完全不联网）。
     #[serde(default)]
     pub llm_enabled: bool,
@@ -91,6 +100,7 @@ impl Default for Settings {
             omdb_key: String::new(),
             douban_enabled: false,
             douban_cookie: String::new(),
+            auto_scrape_after_scan: false,
             llm_enabled: false,
             llm_base_url: String::new(),
             llm_api_key: String::new(),
@@ -170,9 +180,19 @@ pub fn load_omdb_key(conn: &Connection) -> String {
 /// 默认关闭 —— 没写过这个键就是 `false`，不会因为升级而偷偷开始联网抓豆瓣。
 pub fn load_douban_config(conn: &Connection) -> (bool, String) {
     let enabled = read_value(conn, KEY_DOUBAN_ENABLED)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(parse_bool)
         .unwrap_or(false);
     (enabled, read_value(conn, KEY_DOUBAN_COOKIE).unwrap_or_default())
+}
+
+/// 「扫描 / 导入后自动刮削」是否开启（默认关闭）。
+pub fn load_auto_scrape(conn: &Connection) -> bool {
+    read_value(conn, KEY_AUTO_SCRAPE).map(parse_bool).unwrap_or(false)
+}
+
+/// 布尔设置统一口径：`1` / `true`（不分大小写）为真，其余为假。
+fn parse_bool(v: String) -> bool {
+    v == "1" || v.eq_ignore_ascii_case("true")
 }
 
 /// 读取大模型配置（脏文件名解析增强层，可选）。
@@ -216,6 +236,7 @@ pub fn get_settings(state: State<'_, Mutex<Connection>>) -> Result<Settings, Str
         omdb_key: load_omdb_key(&conn),
         douban_enabled: load_douban_config(&conn).0,
         douban_cookie: load_douban_config(&conn).1,
+        auto_scrape_after_scan: load_auto_scrape(&conn),
         llm_enabled: load_llm_config(&conn).enabled,
         llm_base_url: read_value(&conn, KEY_LLM_BASE_URL).unwrap_or_default(),
         llm_api_key: read_value(&conn, KEY_LLM_API_KEY).unwrap_or_default(),
@@ -250,6 +271,12 @@ pub fn set_settings(
     .map_err(|e| e.to_string())?;
     write_value(&conn, KEY_DOUBAN_COOKIE, settings.douban_cookie.trim())
         .map_err(|e| e.to_string())?;
+    write_value(
+        &conn,
+        KEY_AUTO_SCRAPE,
+        if settings.auto_scrape_after_scan { "1" } else { "0" },
+    )
+    .map_err(|e| e.to_string())?;
     write_value(
         &conn,
         KEY_LLM_ENABLED,
