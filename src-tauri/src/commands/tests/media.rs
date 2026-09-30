@@ -1047,3 +1047,42 @@ fn unrelated_manual_series_does_not_swallow_other_shows() {
     assert_eq!(other, 1, "它应该照常建自己的剧集");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 文件夹名与手建标题**不一致**时，只能靠 `find_manual_series` 的标题归一化命中
+/// （分组键精确相等这条规则在这里失效）。这是用户真实场景里最常见的一种：
+/// 文件放在「86版西游记」目录里，但手建的剧集叫「西游记」。
+#[test]
+fn manual_series_matches_by_title_when_folder_name_differs() {
+    let shapes: &[&str] = &[
+        "86版西游记/西游记.{n:02}.mkv",
+        "86版西游记/西游记.1986.{n:02}.mkv",
+        "老剧整理/西游记.第{n:02}集.mkv",
+        // 目录名不同 + 文件名夹着电视台标记：噪声词抹掉后才对得上
+        "老剧整理/西游记.1986.CCTV.{n:02}.mkv",
+    ];
+    for shape in shapes {
+        let dir = scene_dir("xyj-diffdir");
+        touch_files(
+            &dir,
+            &(1..=25)
+                .map(|n| shape.replace("{n:02}", &format!("{n:02}")))
+                .collect::<Vec<_>>(),
+        );
+        let mut conn = memory_db();
+        let ts = db::now_epoch();
+        let manual = insert_manual_media(&conn, "西游记", "tv", None, None, None, ts).unwrap();
+        import_folder_sync(&mut conn, &dir.to_string_lossy(), None).unwrap();
+
+        assert_eq!(
+            episodes_of(&conn, manual),
+            25,
+            "目录名不同时 {shape} 也应并入手建剧集（靠标题归一化命中）"
+        );
+        let series: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media WHERE type='tv'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(series, 1, "{shape} 不该另建剧集");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+

@@ -358,6 +358,10 @@ pub struct ImportFolderResult {
     pub failed: i64,
     /// 挂到目标栏目下的影视条数。
     pub linked: i64,
+    /// 从别的剧集改挂到已存在剧集下的单集数（老数据自愈）。
+    pub repointed: i64,
+    /// 清理掉的空剧集条目数。
+    pub dropped_shells: i64,
     pub message: String,
 }
 
@@ -382,6 +386,8 @@ pub fn import_folder_sync(
             skipped: 0,
             failed: 0,
             linked: 0,
+            repointed: 0,
+            dropped_shells: 0,
             message: "该目录下没有找到视频文件".to_string(),
         });
     }
@@ -423,6 +429,8 @@ pub fn import_folder_sync(
         skipped,
         failed,
         linked,
+        repointed: stats.repointed as i64,
+        dropped_shells: stats.dropped_shells as i64,
         message: parts.join("，"),
     })
 }
@@ -496,8 +504,10 @@ pub async fn import_folder(
     .await
     .map_err(|e| format!("导入任务异常：{e}"))??;
 
-    // 有新增才值得触发；开关关闭 / 已有任务时是空操作
-    if result.added > 0 {
+    // 有新增、或发生了「改挂 / 清壳」才值得触发；开关关闭 / 已有任务时是空操作。
+    // 只看 added 会漏掉自愈场景：重复导入时 added=0，但单集刚被改挂到手建剧集下，
+    // 而那条手建剧集往往正是一条还没刮过、最需要刮削的条目。
+    if result.added > 0 || result.repointed > 0 || result.dropped_shells > 0 {
         crate::commands::scrape::maybe_auto_scrape(&app, scrape.inner());
     }
     Ok(result)

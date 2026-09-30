@@ -610,3 +610,60 @@ fn auto_scrape_yields_to_a_running_manual_task() {
     assert!(control.cancelled(), "不能把用户点的取消给清掉");
     assert!(control.running());
 }
+
+/// 用户手建 / 锁定过的条目，片名归用户所有：豆瓣接管只能补元数据，**不能改名**。
+///
+/// 这是「手建剧集接不进内容」那个 bug 的另一条触发路径 ——
+/// 片名一旦被改成豆瓣的写法，`find_manual_series` 的归一化匹配就可能失效，
+/// 下次导入又会接不进来。
+#[test]
+fn douban_takeover_keeps_user_owned_title() {
+    for (tag, sql) in [
+        ("手建", "source = 'manual'"),
+        ("锁定", "locked = 1"),
+    ] {
+        let conn = memory_db();
+        let id = insert_media(&conn, "tv", "西游记");
+        conn.execute(
+            &format!("UPDATE media SET {sql} WHERE id = ?1"),
+            params![id],
+        )
+        .unwrap();
+
+        let m = DoubanMeta {
+            title: Some("西游记 1986".to_string()),
+            original_title: Some("Journey to the West".to_string()),
+            year: Some(1986),
+            overview: Some("央视版西游记。".to_string()),
+            poster: Some("https://img9.doubanio.com/x.jpg".to_string()),
+            rating: Some(9.6),
+            genre: Some("奇幻 / 冒险".to_string()),
+            ..sample_douban_meta()
+        };
+        let fill = apply_douban_takeover(&conn, id, &m).unwrap();
+
+        assert!(fill.took_over, "{tag} 条目仍应接管（补元数据）");
+        assert!(
+            !fill.fields.iter().any(|f| f == "片名"),
+            "{tag} 条目的片名不能被汇报为已改写，实际：{:?}",
+            fill.fields
+        );
+
+        let (title, overview, poster, vote) = read_fill_state(&conn, id);
+        assert_eq!(title, "西游记", "{tag} 条目片名必须保持用户起的那个");
+        // 其余字段照补
+        assert_eq!(overview.as_deref(), Some("央视版西游记。"));
+        assert_eq!(poster.as_deref(), Some("https://img9.doubanio.com/x.jpg"));
+        assert_eq!(vote, Some(9.6));
+    }
+}
+
+/// 普通（非手建、未锁定）条目的片名仍然可以被改写 —— 上面那条保护不能误伤。
+#[test]
+fn douban_takeover_still_renames_ordinary_entries() {
+    let conn = memory_db();
+    let id = insert_media(&conn, "movie", "沙丘.Dune.2021.1080p");
+    let fill = apply_douban_takeover(&conn, id, &sample_douban_meta()).unwrap();
+    assert!(fill.fields.iter().any(|f| f == "片名"));
+    assert_eq!(read_fill_state(&conn, id).0, "沙丘");
+}

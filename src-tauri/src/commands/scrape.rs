@@ -488,8 +488,29 @@ struct DoubanFill {
 ///
 /// 这里可以覆盖 `title`/`year`，因为此刻它们是扫描阶段猜出来的、没有权威来源。
 /// 但只要豆瓣某项为空，就保留原值不动。
+/// 片名是不是归用户所有（手建条目 / 用户编辑锁定过的条目）。
+///
+/// 这类条目的片名**不能被刮削改写**：用户手建的「西游记」一旦被改成豆瓣的写法
+/// （例如「西游记 1986」），`find_manual_series` 的归一化匹配就可能失效，
+/// 下次导入又会接不进来 —— 这正是刚修好的那个 bug 的另一条触发路径。
+fn title_is_user_owned(conn: &Connection, id: i64) -> bool {
+    conn.query_row(
+        "SELECT COALESCE(source, '') = 'manual' OR COALESCE(locked, 0) = 1 \
+         FROM media WHERE id = ?1",
+        params![id],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
 fn apply_douban_takeover(conn: &Connection, id: i64, m: &DoubanMeta) -> Result<DoubanFill, String> {
     let mut fields = Vec::new();
+    // 手建 / 锁定的条目只补元数据，不动片名
+    let new_title = if title_is_user_owned(conn, id) {
+        None
+    } else {
+        m.title.as_deref()
+    };
     conn.execute(
         "UPDATE media SET \
              title          = COALESCE(?2, title), \
@@ -504,7 +525,7 @@ fn apply_douban_takeover(conn: &Connection, id: i64, m: &DoubanMeta) -> Result<D
          WHERE id = ?1",
         params![
             id,
-            m.title.as_deref(),
+            new_title,
             m.original_title.as_deref(),
             m.year,
             m.overview.as_deref(),
@@ -517,7 +538,7 @@ fn apply_douban_takeover(conn: &Connection, id: i64, m: &DoubanMeta) -> Result<D
     )
     .map_err(|e| e.to_string())?;
 
-    if m.title.is_some() {
+    if new_title.is_some() {
         fields.push("片名".to_string());
     }
     if m.overview.is_some() {

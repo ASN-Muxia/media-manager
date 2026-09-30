@@ -479,6 +479,10 @@ export interface ImportFolderResult {
   failed: number;
   /** 挂到目标栏目下的影视条数 */
   linked: number;
+  /** 从别的剧集改挂到已存在剧集下的单集数（老数据自愈） */
+  repointed: number;
+  /** 清理掉的空剧集条目数 */
+  droppedShells: number;
   message: string;
 }
 
