@@ -1086,3 +1086,87 @@ fn manual_series_matches_by_title_when_folder_name_differs() {
     }
 }
 
+
+/* ---------------- 指定归属：推断失败时的兜底入口 ---------------- */
+
+/// `86版西游记.01.mkv` 放在 `86版西游记` 目录里：文件名是缩写/版本前缀，
+/// 目录名也不是剧名 → 两条推断规则都失效，正常导入必然另建一条剧集。
+/// 用 `import_folder_into_sync` 显式指定归属后必须全部进手建的那条。
+#[test]
+fn explicit_target_attaches_files_that_cannot_be_inferred() {
+    let dir = scene_dir("explicit");
+    touch_files(
+        &dir,
+        &(1..=25)
+            .map(|n| format!("86版西游记/86版西游记.{n:02}.mkv"))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut conn = memory_db();
+    let ts = db::now_epoch();
+    let manual = insert_manual_media(&conn, "西游记", "tv", None, None, None, ts).unwrap();
+
+    // 先确认推断路径确实做不到（否则这条用例就没有意义了）
+    let plain = import_folder_sync(&mut conn, &dir.to_string_lossy(), None).unwrap();
+    assert_eq!(
+        episodes_of(&conn, manual),
+        0,
+        "推断路径下这条形状本来就该接不进去（这是本功能存在的理由）"
+    );
+    assert!(plain.added > 0, "但它确实入库了：{plain:?}");
+
+    // 显式指定后必须全部归位
+    let res = import_folder_into_sync(&mut conn, manual, &dir.to_string_lossy(), None).unwrap();
+    assert_eq!(
+        episodes_of(&conn, manual),
+        25,
+        "指定归属后 25 集都要挂到手建剧集下：{res:?}"
+    );
+    assert!(
+        res.message.contains("归入「西游记」"),
+        "提示语要说清楚归到哪一部了，实际：{}",
+        res.message
+    );
+    let series: i64 = conn
+        .query_row("SELECT COUNT(*) FROM media WHERE type='tv'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(series, 1, "不该残留被腾空的剧集：{res:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 指定归属只能用于剧集；往电影里塞单集没有意义，要明确报错而不是静默吞掉。
+#[test]
+fn explicit_target_rejects_non_tv_and_bad_path() {
+    let mut conn = memory_db();
+    let ts = db::now_epoch();
+    let movie = insert_manual_media(&conn, "沙丘", "movie", None, None, None, ts).unwrap();
+
+    let err = import_folder_into_sync(&mut conn, movie, &scene_dir("x").to_string_lossy(), None)
+        .unwrap_err();
+    assert!(err.contains("不是剧集"), "实际错误：{err}");
+
+    let tv = insert_manual_media(&conn, "西游记", "tv", None, None, None, ts).unwrap();
+    let err = import_folder_into_sync(&mut conn, tv, "D://绝不存在//的路径", None).unwrap_err();
+    assert!(err.contains("目录不存在"), "实际错误：{err}");
+
+    let err = import_folder_into_sync(&mut conn, 9999, "D://绝不存在//的路径", None).unwrap_err();
+    assert!(err.contains("找不到"), "实际错误：{err}");
+}
+
+/// 目录里没有视频时要给出明确的空结果，不能报"添加成功 0 集"让人以为坏了。
+#[test]
+fn explicit_target_reports_empty_folder() {
+    let dir = scene_dir("empty");
+    std::fs::create_dir_all(dir.join("子目录")).unwrap();
+    std::fs::write(dir.join("说明.txt"), b"not a video").unwrap();
+
+    let mut conn = memory_db();
+    let ts = db::now_epoch();
+    let tv = insert_manual_media(&conn, "西游记", "tv", None, None, None, ts).unwrap();
+    let res = import_folder_into_sync(&mut conn, tv, &dir.to_string_lossy(), None).unwrap();
+    assert_eq!(res.added, 0);
+    assert!(res.message.contains("没有找到视频文件"), "实际：{}", res.message);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

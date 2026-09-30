@@ -5,6 +5,7 @@ import {
   setMediaTags, tmdbTitle, tmdbYear, tvdbApply,
   type Category, type Episode, type MediaItem, type Tag, type TmdbSearchItem,
 } from "../api/commands";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useMediaStore } from "../stores/mediaStore";
 import { useCategoryStore } from "../stores/categoryStore";
 import { formatScore, typeIcon, typeLabel } from "../constants/mediaType";
@@ -326,6 +327,39 @@ async function applyTvdb(): Promise<void> {
   }
 }
 
+/* ---------------- 指定归属 / 豆瓣刮削 ---------------- */
+/* 「添加文件到这部剧」是推断失败时的兜底入口：`86版西游记.01.mkv`、`XYJ.01.mkv`
+   这类名字里既没有剧名、目录名也不是剧名时，系统无从推断归属，只会另建一条剧集。
+   推断做不到的就让用户显式指定 —— 他正站在这部剧的页面上，这个信息是确定的。 */
+
+const addingFiles = ref(false);
+const doubanBusy = ref(false);
+
+async function addFilesToThisSeries(): Promise<void> {
+  const d = detail.value;
+  if (!d || addingFiles.value) return;
+  const picked = await open({ directory: true, multiple: false, title: "选择要添加的文件夹" });
+  const path = Array.isArray(picked) ? picked[0] : picked;
+  if (!path) return;
+  addingFiles.value = true;
+  try {
+    await store.importFolderInto(d.media.id, String(path), null);
+  } finally {
+    addingFiles.value = false;
+  }
+}
+
+async function scrapeDouban(): Promise<void> {
+  const d = detail.value;
+  if (!d || doubanBusy.value) return;
+  doubanBusy.value = true;
+  try {
+    await store.scrapeDouban(d.media.id);
+  } finally {
+    doubanBusy.value = false;
+  }
+}
+
 async function doSearch(): Promise<void> {
   const d = detail.value;
   if (!d) return;
@@ -387,6 +421,19 @@ function pick(it: TmdbSearchItem): void {
       <button class="btn" @click="store.scrape(detail.media.id)">
         {{ detail.media.tmdb_id ? "重新刮削" : "刮削元数据" }}
       </button>
+      <button
+        class="btn"
+        :disabled="doubanBusy"
+        title="TMDb 已有时只补缺失字段，TMDb 没有时整条由豆瓣接管"
+        @click="scrapeDouban"
+      >{{ doubanBusy ? "豆瓣刮削中…" : "用豆瓣刮削" }}</button>
+      <button
+        v-if="detail.media.type === 'tv'"
+        class="btn"
+        :disabled="addingFiles"
+        title="不靠文件名推断，直接把这个文件夹里的视频归到这部剧下"
+        @click="addFilesToThisSeries"
+      >{{ addingFiles ? "添加中…" : "＋ 添加文件到这部剧" }}</button>
       <button class="btn" title="修改名称 / 类型 / 年份 / 流派 / 简介" @click="emit('edit', detail.media)">
         ✎ 编辑信息
       </button>

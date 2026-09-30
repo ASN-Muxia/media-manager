@@ -435,6 +435,98 @@ pub fn import_folder_sync(
     })
 }
 
+/// 把一个文件夹里的视频**指定**归到某条剧集下，不靠文件名 / 目录名推断。
+///
+/// 存在的理由：`86版西游记.01.mkv`、`XYJ.01.mkv` 这类名字里既没有剧名、
+/// 所在目录名也不是剧名时，系统**无从推断归属**，导入后只会另建一条剧集，
+/// 手建的那条永远接不到内容。推断做不到的，就让用户显式指定 ——
+/// 他正站在这部剧的详情页上，说"这批文件是它的"，这个信息是确定的。
+///
+/// 做法分两步，刻意复用已有能力而不是改扫描器的分组逻辑：
+/// 1. 先照常 `import_folder_sync`（该建什么建什么），这样新文件能正常入库、
+///    已有的文件不会因为 `ON CONFLICT` 冲突而报错；
+/// 2. 再把这批文件路径对应的单集**改挂**到目标剧集，并清掉被腾空的空壳。
+pub fn import_folder_into_sync(
+    conn: &mut Connection,
+    media_id: i64,
+    path: &str,
+    category_id: Option<i64>,
+) -> Result<ImportFolderResult, String> {
+    let (mtype, title): (String, String) = conn
+        .query_row(
+            "SELECT type, title FROM media WHERE id = ?1",
+            params![media_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| format!("找不到 id 为 {media_id} 的条目"))?;
+    if mtype != "tv" {
+        return Err(format!("「{title}」不是剧集，只有剧集能添加单集"));
+    }
+    if !std::path::Path::new(path).is_dir() {
+        return Err(format!("目录不存在或不可访问：{path}"));
+    }
+
+    let roots = vec![path.to_string()];
+    let files = scanner::collect_files_reported(&roots, &mut |_, _, _| true);
+    if files.is_empty() {
+        return Ok(ImportFolderResult {
+            added: 0,
+            skipped: 0,
+            failed: 0,
+            linked: 0,
+            repointed: 0,
+            dropped_shells: 0,
+            message: "该目录下没有找到视频文件".to_string(),
+        });
+    }
+
+    let mut res = import_folder_sync(conn, path, category_id)?;
+
+    // 记下这批单集**原来**挂在哪些剧集下，腾空后好清壳（清壳条件很严，宁可不删）
+    let mut old_groups: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in &files {
+        let p = f.path.to_string_lossy().to_string();
+        if let Ok(Some(g)) = conn.query_row(
+            "SELECT m.group_key FROM episodes e JOIN media m ON m.id = e.media_id \
+             WHERE e.file_path = ?1 AND e.media_id <> ?2",
+            params![p, media_id],
+            |r| r.get::<_, Option<String>>(0),
+        ) {
+            old_groups.insert(g);
+        }
+    }
+
+    let mut moved = 0usize;
+    for f in &files {
+        let p = f.path.to_string_lossy().to_string();
+        if scanner::repoint_episode(conn, media_id, &p).unwrap_or(false) {
+            moved += 1;
+        }
+    }
+
+    let mut shells = 0usize;
+    for g in &old_groups {
+        shells += scanner::drop_empty_series_shells(conn, g).unwrap_or(0);
+    }
+
+    // 没归进去的要说清楚：单文件被判成电影 / 待确认时没有 episodes 行可改挂，
+    // 静默吞掉会让用户以为加进去了。
+    if moved > 0 {
+        res.message = format!("{}，{} 集归入「{}」", res.message, moved, title);
+    } else {
+        res.message = format!(
+            "{}，但没有可归入「{}」的单集（这些文件被判定为电影或待确认）",
+            res.message, title
+        );
+    }
+    res.repointed += moved as i64;
+    res.dropped_shells += shells as i64;
+    if shells > 0 {
+        res.message = format!("{}，清理 {} 个空剧集条目", res.message, shells);
+    }
+    Ok(res)
+}
+
 /// 把刚导入的文件对应的影视条目挂到指定栏目下。
 ///
 /// 电影按 `media.file_path` 直接命中；剧集的单集在 `episodes` 表里，要绕一层
@@ -507,6 +599,38 @@ pub async fn import_folder(
     // 有新增、或发生了「改挂 / 清壳」才值得触发；开关关闭 / 已有任务时是空操作。
     // 只看 added 会漏掉自愈场景：重复导入时 added=0，但单集刚被改挂到手建剧集下，
     // 而那条手建剧集往往正是一条还没刮过、最需要刮削的条目。
+    if result.added > 0 || result.repointed > 0 || result.dropped_shells > 0 {
+        crate::commands::scrape::maybe_auto_scrape(&app, scrape.inner());
+    }
+    Ok(result)
+}
+
+/// 把一个文件夹的视频**指定**归到某条剧集下（界面上的「添加文件到这部剧」）。
+///
+/// 与 `import_folder` 的区别：不靠文件名推断归属，而是以用户在详情页上
+/// 指定的那条剧集为准。用于 `86版西游记.01.mkv` / `XYJ.01.mkv` 这类
+/// 「文件名与目录名都不含剧名」、推断必然失败的情况。
+#[tauri::command]
+pub async fn import_folder_into(
+    app: AppHandle,
+    scrape: State<'_, Arc<ScrapeControl>>,
+    media_id: i64,
+    path: String,
+    category_id: Option<i64>,
+) -> Result<ImportFolderResult, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("请先选择要添加的文件夹".to_string());
+    }
+    let app_for_import = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut conn =
+            crate::store::db::open(&app_for_import).map_err(|e| format!("打开数据库失败：{e}"))?;
+        import_folder_into_sync(&mut conn, media_id, &path, category_id)
+    })
+    .await
+    .map_err(|e| format!("导入任务异常：{e}"))??;
+
     if result.added > 0 || result.repointed > 0 || result.dropped_shells > 0 {
         crate::commands::scrape::maybe_auto_scrape(&app, scrape.inner());
     }

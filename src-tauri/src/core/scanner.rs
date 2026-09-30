@@ -544,7 +544,7 @@ fn is_manual_series(conn: &Connection, media_id: i64) -> Result<bool, String> {
 ///
 /// 只在目标行是**手建剧集**时才调用——那是用户明确指定的归属，改挂不会有歧义；
 /// 自动分组的结果一律不动，避免把正常条目搬来搬去。
-fn repoint_episode(conn: &Connection, media_id: i64, path: &str) -> Result<bool, String> {
+pub(crate) fn repoint_episode(conn: &Connection, media_id: i64, path: &str) -> Result<bool, String> {
     let n = conn
         .execute(
             "UPDATE episodes SET media_id = ?2 WHERE file_path = ?1 AND media_id <> ?2",

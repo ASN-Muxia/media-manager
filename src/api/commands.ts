@@ -499,6 +499,24 @@ export function importFolder(path: string, categoryId?: number | null): Promise<
   });
 }
 
+/**
+ * 把一个文件夹的视频**指定**归到某条剧集下（不靠文件名推断）。
+ *
+ * 用于「文件名与目录名都不含剧名」、推断必然失败的情况
+ * （如 `86版西游记.01.mkv`、`XYJ.01.mkv`）。
+ */
+export function importFolderInto(
+  mediaId: number,
+  path: string,
+  categoryId?: number | null,
+): Promise<ImportFolderResult> {
+  return invoke<ImportFolderResult>("import_folder_into", {
+    mediaId,
+    path,
+    categoryId: categoryId ?? null,
+  });
+}
+
 /** 编辑资源基本信息的输入（这几个字段全量覆盖；留空 = 清空）。 */
 export interface UpdateMediaInput {
   id: number;

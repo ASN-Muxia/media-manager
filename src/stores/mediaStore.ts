@@ -10,7 +10,8 @@ import {
   playMedia, reclassifyMedia as apiReclassify, revealInExplorer,
   scanLibrary, scrapeAll as apiScrapeAll, scrapeMedia,
   updateMedia as apiUpdateMedia,
-  importFolder as apiImportFolder,
+  importFolder as apiImportFolder, importFolderInto as apiImportFolderInto,
+  doubanApply as apiDoubanApply,
   type CreateMediaInput, type ImportFolderResult, type MediaDetail, type MediaItem,
   type MovieCollection, type ReclassifyResult,
   type ScanHistoryItem, type ScanProgress, type ScanStats, type ScrapeProgress,
@@ -294,6 +295,59 @@ export const useMediaStore = defineStore("media", () => {
   }
 
   /**
+   * 把一个文件夹的视频**指定**归到某条剧集下（详情页的「添加文件到这部剧」）。
+   *
+   * 与 `importFolder` 的区别：归属由用户指定，不靠文件名推断。用在
+   * 「文件名和目录名都不含剧名」、推断必然失败的场景。
+   */
+  async function importFolderInto(
+    mediaId: number,
+    path: string,
+    categoryId: number | null,
+  ): Promise<ImportFolderResult | null> {
+    error.value = null;
+    try {
+      const r = await apiImportFolderInto(mediaId, path, categoryId);
+      note(r.message);
+      await load();
+      await loadHistory();
+      // 详情里的单集列表变了，要同步；当前正打开这条就刷新它
+      if (selectedId.value !== null) await openDetail(selectedId.value);
+      return r;
+    } catch (e) {
+      error.value = String(e);
+      note("添加失败：" + String(e));
+      return null;
+    }
+  }
+
+  /**
+   * 用豆瓣刮削指定条目（TMDb 有结果时只补缺失，否则整条由豆瓣接管）。
+   *
+   * 与 `scrape` 走同一套结果契约，所以提示语与刷新逻辑一致。
+   */
+  async function scrapeDouban(
+    id: number,
+    query?: string | null,
+    year?: number | null,
+  ): Promise<void> {
+    error.value = null;
+    try {
+      const r = await apiDoubanApply(id, query ?? null, year ?? null);
+      note(
+        r.ok
+          ? `豆瓣刮削成功：${r.title ?? ""}${r.episodes > 0 ? `（同步 ${r.episodes} 集）` : ""}`
+          : r.message,
+      );
+      await openDetail(id);
+      await load();
+    } catch (e) {
+      error.value = String(e);
+      note("豆瓣刮削失败：" + String(e));
+    }
+  }
+
+  /**
    * 删减某个聚合剧目下的单集（单条 / 批量都走这里）。
    *
    * 只删传入的单集 id，其他剧目不受影响；删完同步刷新详情与列表（集数变了）。
@@ -536,6 +590,7 @@ export const useMediaStore = defineStore("media", () => {
     scrape, scrapeMissing, cancelScrape, play, reveal, remove, clearAll,
     visibleItems, note,
     isSelected, toggleSelect, toggleSelectAll, clearSelection, removeSelected,
-    importFolder, removeEpisodes, loadCollections, reclassify,
+    importFolder, importFolderInto, removeEpisodes, loadCollections, reclassify,
+    scrapeDouban,
   };
 });

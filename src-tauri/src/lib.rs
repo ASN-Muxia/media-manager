@@ -70,6 +70,7 @@ pub fn run() {
             commands::media::delete_media_batch,
             commands::media::delete_episodes,
             commands::media::import_folder,
+            commands::media::import_folder_into,
             commands::media::reclassify_media,
             commands::media::get_movie_collections,
             // 分类与标签

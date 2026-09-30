@@ -4,7 +4,9 @@ import { nextTick } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import MediaDetail from "./MediaDetail.vue";
 import { useMediaStore } from "../stores/mediaStore";
-import { getMediaCategories, getMediaTags } from "../api/commands";
+import {
+  doubanApply, getMediaCategories, getMediaTags, importFolderInto,
+} from "../api/commands";
 import type { Episode, MediaItem } from "../api/commands";
 
 /**
@@ -16,6 +18,11 @@ import type { Episode, MediaItem } from "../api/commands";
  *
  * 后端命令整体 mock：单测不碰真实 Tauri。
  */
+/** 原生目录选择器的桩：组件里由它拿路径，用例里直接给结果。 */
+const dialog = vi.hoisted(() => ({ open: vi.fn(async () => null as string | null) }));
+vi.mock("@tauri-apps/plugin-dialog", () => dialog);
+
+// 工厂是「首次导入时才执行」的，那时 MEDIA / ONE_SEASON 已初始化，可以放心引用。
 vi.mock("../api/commands", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/commands")>();
   return {
@@ -24,6 +31,16 @@ vi.mock("../api/commands", async (importOriginal) => {
     listTags: vi.fn(async () => []),
     getMediaCategories: vi.fn(async () => []),
     getMediaTags: vi.fn(async () => []),
+    getMediaList: vi.fn(async () => []),
+    getScanHistory: vi.fn(async () => []),
+    getMediaDetail: vi.fn(async () => ({ media: MEDIA, episodes: ONE_SEASON })),
+    importFolderInto: vi.fn(async () => ({
+      added: 0, skipped: 25, failed: 0, linked: 0,
+      repointed: 25, droppedShells: 1, message: "25 集归入「西游记」",
+    })),
+    doubanApply: vi.fn(async () => ({
+      ok: true, mediaId: 1, tmdbId: null, title: "西游记", episodes: 0, message: "ok",
+    })),
   };
 });
 
@@ -333,5 +350,54 @@ describe("MediaDetail 进入详情 / 换条目", () => {
     await vi.waitFor(() => expect(getMediaCategories).toHaveBeenCalledWith(2));
     // 勾选也必须跟着清掉，两条都在同一个回调里
     expect(picked(w)).toEqual([]);
+  });
+});
+
+/**
+ * 「添加文件到这部剧」是推断失败时的兜底：`86版西游记.01.mkv` 这类形状
+ * 两条推断规则都失效，只能由用户显式指定归属。这里验证按钮真的接上了。
+ */
+describe("MediaDetail 指定归属与豆瓣刮削", () => {
+  function actionButton(w: VueWrapper, text: string) {
+    const b = w.findAll(".actions button").find((n) => n.text().includes(text));
+    if (!b) throw new Error(`操作区里没有「${text}」按钮`);
+    return b;
+  }
+
+  it("剧集详情页才有「添加文件到这部剧」", () => {
+    expect(actionButton(mountDetail(), "添加文件到这部剧").exists()).toBe(true);
+    const movie = mount(MediaDetail, { attachTo: document.body });
+    wrappers.push(movie);
+    const st = useMediaStore();
+    st.selectedId = 9;
+    st.detail = { media: { ...MEDIA, type: "movie" }, episodes: [] };
+    return nextTick().then(() => {
+      expect(
+        movie.findAll(".actions button").some((n) => n.text().includes("添加文件到这部剧")),
+      ).toBe(false);
+    });
+  });
+
+  it("选好文件夹后按 id 与路径调用指定归属", async () => {
+    const w = mountDetail();
+    dialog.open.mockResolvedValueOnce("D:////86版西游记");
+    await actionButton(w, "添加文件到这部剧").trigger("click");
+    await vi.waitFor(() => {
+      expect(importFolderInto).toHaveBeenCalledWith(1, "D:////86版西游记", null);
+    });
+  });
+
+  it("取消目录选择时什么都不做", async () => {
+    const w = mountDetail();
+    dialog.open.mockResolvedValueOnce(null);
+    await actionButton(w, "添加文件到这部剧").trigger("click");
+    await nextTick();
+    expect(importFolderInto).not.toHaveBeenCalled();
+  });
+
+  it("「用豆瓣刮削」按钮调 doubanApply", async () => {
+    const w = mountDetail();
+    await actionButton(w, "用豆瓣刮削").trigger("click");
+    await vi.waitFor(() => expect(doubanApply).toHaveBeenCalledWith(1, null, null));
   });
 });
