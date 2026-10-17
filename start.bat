@@ -3,17 +3,26 @@ setlocal EnableExtensions
 chcp 936 >nul 2>&1
 
 rem ==========================================================================
-rem  media-manager 一键启动
+rem  media-manager 一键启动（唯一入口 · 2026-10-17 合并版）
+rem
+rem  由原 start.bat 与 scripts\启动影视库.vbs 合并而来，行为：
+rem    * 按需构建：判据是「内容指纹」（mjs\dev\need-build.mjs），改测试文件 /
+rem      编辑器 touch / 云盘或杀软刷时间戳都不再触发无谓构建；构建成功后
+rem      自动写指纹（--commit），下次双击直接秒开。
+rem    * 构建前自动清掉残留实例（原 vbs 的 KillStale），避免链接「拒绝访问」
+rem      与多实例抢 WebView2 数据目录。
+rem    * 成功启动后控制台立即关闭，只留主界面；出错才停留显示原因。
+rem
 rem  用法：
-rem    双击本文件           = 构建（按需）后启动
-rem    start.bat --release  = 用 release 模式构建后启动（首次较慢）
-rem    start.bat --no-build = 跳过构建，直接启动已编译好的 exe
+rem    双击本文件            = 按需构建后启动（默认 release，无改动则秒开）
+rem    start.bat --no-build  = 跳过构建判定，直接启动已有 exe
+rem    start.bat --debug     = 用 debug 模式构建后启动
+rem    start.bat --force     = 忽略指纹，强制完整重建
 rem
 rem  依赖：Node.js、Rust 工具链、MSVC 生成工具、WebView2 运行时
 rem  路径可用环境变量覆盖：MM_NODE / MM_CARGO / MM_RUSTC
 rem
-rem  说明：脚本刻意不用 `if (...)` 代码块包裹可变命令，
-rem        因为在块内 %ERRORLEVEL% 会在解析期展开，导致判错。
+rem  ? 本文件必须保持 GBK + CRLF，否则 cmd 会把它解析成一团。
 rem ==========================================================================
 
 set "MM_ROOT=%~dp0"
@@ -21,13 +30,11 @@ if "%MM_ROOT:~-1%"=="\" set "MM_ROOT=%MM_ROOT:~0,-1%"
 
 set "MM_PROFILE=release"
 set "MM_DO_BUILD=1"
-if /i "%~1"=="--release" set "MM_PROFILE=release"
+set "MM_FORCE_FLAG="
 if /i "%~1"=="--debug" set "MM_PROFILE=debug"
 if /i "%~1"=="--no-build" set "MM_DO_BUILD=0"
-set "MM_FORCE_FLAG="
 if /i "%~1"=="--force" set "MM_FORCE_FLAG=--force"
 if /i "%~2"=="--force" set "MM_FORCE_FLAG=--force"
-rem 脚本会自动判断前端 / Rust 是否已最新，已最新则跳过构建（--force 强制重新构建）
 
 rem ---- 默认路径（可用环境变量覆盖）----
 if not defined MM_NODE set "MM_NODE=C:\Users\31506\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
@@ -49,6 +56,8 @@ set "CARGO_HTTP_CHECK_REVOKE=false"
 set "RUSTUP_AUTO_INSTALL=0"
 if exist "%MM_RUSTC%" set "RUSTC=%MM_RUSTC%"
 
+set "MM_EXE=%MM_ROOT%\src-tauri\target\%MM_PROFILE%\media-manager.exe"
+
 echo.
 echo ==========================================================
 echo   media-manager 一键启动
@@ -60,70 +69,59 @@ echo   Cargo    : %MM_CARGO%
 echo ==========================================================
 echo.
 
+if "%MM_DO_BUILD%"=="0" goto :launch
 if not exist "%MM_NODE%" goto :err_node
 if not exist "%MM_CARGO%" goto :err_cargo
 
-if "%MM_DO_BUILD%"=="1" call :do_build
-if "%MM_DO_BUILD%"=="1" if errorlevel 1 goto :fail
+rem ---------------------------------------------------------------- 按需构建
+rem need-build 退出码 0 = 需要构建（同时打印原因）；1 = 已是最新。
+set "MM_NEED_FE=0"
+set "MM_NEED_RS=0"
+call "%MM_NODE%" "%MM_ROOT%\mjs\dev\need-build.mjs" --frontend %MM_FORCE_FLAG%
+if not errorlevel 1 set "MM_NEED_FE=1"
+call "%MM_NODE%" "%MM_ROOT%\mjs\dev\need-build.mjs" --rust --profile %MM_PROFILE% %MM_FORCE_FLAG%
+if not errorlevel 1 set "MM_NEED_RS=1"
 
-set "MM_EXE=%MM_ROOT%\src-tauri\target\%MM_PROFILE%\media-manager.exe"
+if "%MM_NEED_FE%"=="0" if "%MM_NEED_RS%"=="0" goto :launch
+
+rem 要构建就先清残留实例：占住 exe 会让链接失败或变慢（实测报「拒绝访问」），
+rem 多实例抢同一个 WebView2 数据目录还会误触发「启动异常」弹窗。
+taskkill /F /IM media-manager.exe >nul 2>nul
+
+if "%MM_NEED_FE%"=="0" goto :rust_step
+echo [1/2] 构建前端 (vite build) ...
+pushd "%MM_ROOT%"
+call "%MM_NODE%" node_modules\vite\bin\vite.js build
+set "MM_RC=%ERRORLEVEL%"
+popd
+if not "%MM_RC%"=="0" goto :err_frontend
+call "%MM_NODE%" "%MM_ROOT%\mjs\dev\need-build.mjs" --frontend --commit
+
+:rust_step
+if "%MM_NEED_RS%"=="0" goto :launch
+echo [2/2] 构建 Rust (cargo build --%MM_PROFILE%，首次需要几分钟，请耐心等待) ...
+if "%MM_PROFILE%"=="release" call "%MM_CARGO%" build --release --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
+if "%MM_PROFILE%"=="debug" call "%MM_CARGO%" build --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
+if errorlevel 1 goto :err_rust
+call "%MM_NODE%" "%MM_ROOT%\mjs\dev\need-build.mjs" --rust --profile %MM_PROFILE% --commit
+
+:launch
 if not exist "%MM_EXE%" goto :err_noexe
-
 echo.
-echo [3/3] 启动应用 ...
+echo 启动应用 ...
 start "" "%MM_EXE%"
-echo.
-echo 应用已启动。数据库位置：%%APPDATA%%\com.example.media-manager\
+echo 完成。数据库位置：%%APPDATA%%\com.example.media-manager\
 echo.
 echo 首次使用建议顺序：
 echo   1. 左侧「设置」-^> 添加媒体目录 -^> 点「保存并扫描媒体库」
 echo   2. 在设置里填 TMDB API Key -^> 回列表点「批量刮削」
 echo   3. 配好 PotPlayer 路径后，点海报进详情页即可播放
 echo.
-echo 想验证整个项目是否健康，可双击 verify.bat。
+echo 想验证整个项目是否健康，可双击 verify.bat；要打源码分发包，双击 package.bat。
 echo.
 rem 成功后立即关闭控制台，只保留软件主界面（不再停留 pause 黑窗）；
 rem 出错路径仍会停在控制台，便于查看错误。
 exit /b 0
-
-rem ------------------------------------------------------------------ 子过程
-:do_build
-pushd "%MM_ROOT%"
-call :need_frontend
-if errorlevel 1 goto :fe_skip
-echo [1/3] 构建前端 ...
-call "%MM_NODE%" node_modules\vite\bin\vite.js build
-set "MM_RC=%ERRORLEVEL%"
-popd
-if not "%MM_RC%"=="0" goto :err_frontend
-goto :rust_step
-
-:fe_skip
-echo [1/3] 构建前端 ... 已是最新，跳过
-popd
-
-:rust_step
-echo.
-echo [2/3] 构建 Rust（首次构建需要几分钟，请耐心等待）...
-call :need_rust
-if errorlevel 1 goto :rs_skip
-if "%MM_PROFILE%"=="release" call "%MM_CARGO%" build --release --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
-if "%MM_PROFILE%"=="debug" call "%MM_CARGO%" build --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
-if errorlevel 1 goto :err_rust
-exit /b 0
-
-:rs_skip
-echo       Rust 已是最新，跳过
-exit /b 0
-
-rem ---- 构建判定：退出码 0=需要构建，1=可以跳过 ----
-:need_frontend
-call "%MM_NODE%" "%MM_ROOT%\mjs\dev\need-build.mjs" --frontend %MM_FORCE_FLAG%
-exit /b %ERRORLEVEL%
-
-:need_rust
-call "%MM_NODE%" "%MM_ROOT%\mjs\dev\need-build.mjs" --rust --profile %MM_PROFILE% %MM_FORCE_FLAG%
-exit /b %ERRORLEVEL%
 
 :err_node
 echo [错误] 找不到 Node.js。

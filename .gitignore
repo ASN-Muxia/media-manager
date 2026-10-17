@@ -33,3 +33,9 @@ yarn-error.log*
 release/
 *.zip
 *.tar.gz
+
+# 构建内容指纹（机器本地状态，不进仓库）
+mjs/dev/.build-stamp/
+
+# 运行日志归档（杂物，只留本机）
+logs/

@@ -21,24 +21,41 @@ TMDB 元数据、封面墙浏览、剧集分组，并可一键用 PotPlayer 播�
 
 ## 二、快速启动（推荐）
 
-**三个入口指向同一个 exe**（`src-tauri\target\release\media-manager.exe`），行为一致：
-
-| 入口                  | 怎么用           | 会不会重新构建                           |
-| ------------------- | ------------- | --------------------------------- |
-| `start.bat`         | 双击；看得见构建过程与报错 | ✅ 会（`vite build` + `cargo build`） |
-| `scripts\启动影视库.vbs` | 双击；**全程不弹黑框** | 只在 exe 比前端旧时才静默构建                 |
-| `media-manager.exe` | 直接双击二进制       | ❌ 不会（跑的是上一次构建的产物）                 |
+**唯一入口：双击根目录 `start.bat`**（2026-10-17 起，原 `start.bat` 与
+`scripts\启动影视库.vbs` 已合并为这一个；vbs 旧版归档在 `tools\`，仅作留档，勿再使用）。
 
 ```
-start.bat                # 构建后启动（默认 release）
+start.bat                # 按需构建后启动（默认 release）；无改动时秒开
 start.bat --debug        # 用 debug 模式构建后启动
-start.bat --no-build     # 跳过构建，直接启动已有 exe
+start.bat --no-build     # 跳过构建判定，直接启动已有 exe
+start.bat --force        # 忽略指纹，强制完整重建
 ```
 
-⚠️ **改了前端代码之后，必须让 Rust 重新编译一次**，否则双击 exe 跑的还是旧界面：  
-前端产物（`dist/`）是**编译期嵌进 exe** 的。`src-tauri\build.rs` 已补了  
-`cargo:rerun-if-changed=../dist`，所以只要走 `start.bat`（或 vbs 的自动构建），  
-改完代码双击即可生效；**直接双击 exe 不会重新嵌入**，那一条路只适合"跑上次构建好的版本"。
+它做三件事：① 用**内容指纹**判断要不要构建（见下）；② 要构建时先清残留实例再
+`vite build` / `cargo build`，成功后写回指纹；③ 拉起 exe 后自动关控制台，
+出错才停留显示原因。
+
+### 为什么现在不会"每次启动都构建"了（2026-10-17 修复）
+
+旧判据是「源码 mtime 比产物新就构建」，有三个病根：
+
+1. **测试文件被算进构建输入**——`src/**/*.spec.ts` 一改（哪怕只是跑测试刷新时间戳），
+   下次启动白白重跑 `vite build`，而 vite 根本不打包它们；
+2. **mtime 本身不可靠**——编辑器格式化、云盘同步、杀软扫描、`git checkout` 都会
+   刷新时间戳，"没改代码"也会被误判成"要构建"；
+3. **入口分裂**——vbs 与 bat、debug 与 release 产物互相不认识，交替用就互相触发重建。
+
+现在 `mjs/dev/need-build.mjs` 改为**内容指纹（sha256）**：对真正的构建输入集合
+（前端：src 源码〔不含测试〕+ 入口与配置；Rust：src-tauri 源码 + 清单 + 配置）
+算指纹存到 `mjs/dev/.build-stamp/`（git 忽略），构建成功后写章。
+**内容没变，时间戳怎么抖都不会触发构建**；真改了哪个文件，判定还会打印原因。
+首次运行会自动引导建基线（产物比输入新就直接写章跳过，不会多构建一次）。
+
+> ⚠️ 改了前端代码**不再需要**重编 Rust：前端产物由 exe 在**运行时**读磁盘 `dist/`
+> （见 `src-tauri/src/assets.rs`，2026-10-16 架构改动），`vite build` 亚秒级完成即生效。
+> 只有动了 Rust 侧才会触发 `cargo build`（实测重链约 41.6 秒）。
+> 直接双击 exe（`src-tauri\target\release\media-manager.exe`）仍可跑上次构建的版本，
+> 但不会自动构建，日常启动请用 `start.bat`。
 
 ### `verify.bat` —— 一键盘点
 
@@ -70,8 +87,9 @@ MM_RUSTC  rustc.exe 完整路径
 
 另外两个变量：`MM_NO_PAUSE=1` 跳过结束前的「按任意键继续」（便于自动化调用）。
 
-> ⚠️ **两个 .bat 是 GBK 编码**（中文 Windows 的 cmd 按 GBK 解析批处理文件，用 UTF-8 保存会导致  
-> 命令解析错乱）。若要修改，请在 GBK 编码下编辑，勿用 UTF-8 覆盖保存。
+> ⚠️ **三个 .bat（start / verify / package）是 GBK + CRLF 编码**（中文 Windows 的 cmd 按 GBK
+> 解析批处理文件，用 UTF-8 保存会导致命令解析错乱）。若要修改，请在 GBK 编码下编辑，
+> 勿用 UTF-8 覆盖保存。`.gitattributes` 已把 `*.bat` 钉死为 CRLF。
 
 ## 三、手动构建与开发
 
@@ -260,8 +278,13 @@ src-tauri/src/            后端（Rust，分层且禁止反向依赖）
 mjs/dev/check-layering.mjs 分层合规静态检查（core 不许依赖 store/provider/commands）
 mjs/dev/dev-server.mjs    不依赖 cmd PATH 的 vite dev server 启动器
 mjs/dev/run-tests.mjs     Vitest 启动器（修 watch 模式静默降级与 EPERM）
-start.bat / verify.bat    快速启动与一键盘点
+mjs/dev/need-build.mjs    构建判定（内容指纹 sha256；--commit 写章）
+start.bat                 唯一启动入口（按需构建 + 启动，合并了原 vbs）
+verify.bat                一键盘点（七项检查）
+package.bat               源码打包（git 跟踪文件 → zip/tar.gz）
 docs/                     调研、架构、交接与打包说明
+tools/                    归档的一次性工具（scan_video_exts.py、旧版 vbs 启动器）
+logs/                     运行日志归档（git 忽略）
 ```
 
 **分层依赖方向（单向，不可逆）**：
