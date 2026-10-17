@@ -5,8 +5,13 @@
 //! 换句话说，即使把整个 GUI 和数据库换掉，这里也不用改一行。
 //! 这也是本项目最容易写单测的一部分（175+ 条 Rust 单测大多在此）。
 
-pub mod collection;
+pub mod diff;
 pub mod grouping;
+pub mod matching;
 pub mod mediatype;
+pub mod nfo;
 pub mod parser;
+// 资源目录库的纯规则：路径指纹判定 + 何时把库里那行标成 missing。
+pub mod registry;
 pub mod scanner;
+pub mod tree;

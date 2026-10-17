@@ -178,6 +178,24 @@ pub struct TmdbSearchItem {
     pub release_date: Option<String>,
     #[serde(default)]
     pub first_air_date: Option<String>,
+    /// 原标题（电影 `original_title` / 剧集 `original_name`）。
+    ///
+    /// **多语言匹配全靠它**：用中文检索时 TMDB 返回的 `title` 是译名，
+    /// `original_title` 才是原名；本地条目手里握着另一个语言的叫法时，
+    /// 只有比对到这一层才能接住。
+    #[serde(default)]
+    pub original_title: Option<String>,
+    #[serde(default)]
+    pub original_name: Option<String>,
+    /// 匹配打分：`search_tmdb` 专用，其余路径（详情 / 缓存）不会带。
+    ///
+    /// 之所以挂在候选上而不是另开一个结构：命令的返回类型必须保持
+    /// `Vec<TmdbSearchItem>`，加字段是向后兼容的加法，前端按 `?.` 取即可。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_score: Option<i32>,
+    /// 命中原因（给人看的解释：「年份一致」「别名完全一致」……）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_reasons: Option<Vec<String>>,
 }
 
 impl TmdbSearchItem {
@@ -191,6 +209,18 @@ impl TmdbSearchItem {
             .unwrap_or_default()
     }
 
+    /// 原标题：电影 `original_title`、剧集 `original_name`。
+    pub fn original(&self) -> Option<&str> {
+        self.original_title
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                self.original_name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+            })
+    }
+
     pub fn date(&self) -> Option<String> {
         self.release_date
             .clone()
@@ -199,7 +229,10 @@ impl TmdbSearchItem {
 }
 
 /// 归一化后的元数据。
-#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+///
+/// 带 `Deserialize` 是为了能进 `provider_cache` 表（缓存层在 commands 旁路读写，
+/// 不改变 provider 自身的函数契约与优先级顺序）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TmdbMeta {
     pub tmdb_id: i64,
     pub title: String,
@@ -260,6 +293,9 @@ impl TmdbMeta {
 struct SearchResponse {
     #[serde(default)]
     results: Vec<TmdbSearchItem>,
+    /// 总页数：拉多页时用它提前收工，别白跑一趟空页。
+    #[serde(default)]
+    total_pages: Option<i64>,
 }
 
 /// 某一季里的单集条目。
@@ -346,13 +382,26 @@ impl TmdbClient {
         crate::provider::http::get_json::<T>(&self.agent, "TMDB", &url, &[])
     }
 
-    /// 搜索电影 / 剧集。`kind` 为 `movie` 或 `tv`。
+    /// 搜索电影 / 剧集（**第一页**）。`kind` 为 `movie` 或 `tv`。
+    ///
+    /// 自动刮削链路走这个入口，行为与改造前一致（TMDB 默认每页 20 条）。
     pub fn search(
         &self,
         kind: &str,
         query: &str,
         year: Option<i32>,
     ) -> Result<Vec<TmdbSearchItem>, String> {
+        Ok(self.search_page(kind, query, year, 1)?.0)
+    }
+
+    /// 搜索**指定页**。返回值是 `(本页结果, 总页数)`。
+    pub fn search_page(
+        &self,
+        kind: &str,
+        query: &str,
+        year: Option<i32>,
+        page: u32,
+    ) -> Result<(Vec<TmdbSearchItem>, i64), String> {
         let (path, year_key) = if kind == "tv" {
             ("/search/tv", "first_air_date_year")
         } else {
@@ -362,12 +411,49 @@ impl TmdbClient {
             ("query", query.to_string()),
             ("language", self.language().to_string()),
             ("include_adult", "false".to_string()),
+            ("page", page.max(1).to_string()),
         ];
         if let Some(y) = year {
             q.push((year_key, y.to_string()));
         }
         let resp: SearchResponse = self.get_json(path, &q)?;
-        Ok(resp.results)
+        Ok((resp.results, resp.total_pages.unwrap_or(1).max(1)))
+    }
+
+    /// 连续拉多页直到够数 / 拉完，按 id 去重。
+    ///
+    /// 存在的理由：手动匹配时用户要**看得全**。只拿第一页（20 条）会让真正
+    /// 想要的那个候选常常排在第 21 条之后，用户只能反复改关键词碰运气。
+    ///
+    /// `max_pages` 是硬闸门（避免关键词很泛时把整个库翻一遍）；
+    /// 单页为空、够了数、或已到末页都会提前收工。
+    pub fn search_many(
+        &self,
+        kind: &str,
+        query: &str,
+        year: Option<i32>,
+        max_items: usize,
+        max_pages: u32,
+    ) -> Result<Vec<TmdbSearchItem>, String> {
+        let mut out: Vec<TmdbSearchItem> = Vec::new();
+        let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        let pages = max_pages.max(1);
+        for p in 1..=pages {
+            let (items, total) = self.search_page(kind, query, year, p)?;
+            let empty = items.is_empty();
+            for it in items {
+                if seen.insert(it.id) {
+                    out.push(it);
+                }
+            }
+            if empty || p as i64 >= total || (max_items > 0 && out.len() >= max_items) {
+                break;
+            }
+        }
+        if max_items > 0 && out.len() > max_items {
+            out.truncate(max_items);
+        }
+        Ok(out)
     }
 
     /// 取详情并归一化。

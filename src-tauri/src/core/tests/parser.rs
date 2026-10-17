@@ -275,3 +275,158 @@ fn tag_regex_matches_every_listed_token() {
         assert!(r.year == Some(2020), "{token} 应能被识别为标签（{r:?}）");
     }
 }
+
+/// 裸集号 + 集名：`剧名.01.集名` 是中文库最常见的写法，之前完全认不出来。
+///
+/// 之前 `西游记1986-2000版.01.猴王初问世.mp4` 会得到 `episode=None`，
+/// 于是整条被判成「待确认」的独立条目，永远进不了剧集。
+#[test]
+fn bare_number_with_episode_title_is_a_marker() {
+    for name in [
+        "西游记.01.猴王初问世.mp4",
+        "西游记 01.猴王初问世.mp4",
+        "西游记01.猴王初问世.mkv",
+        "西游记.02.官封弼马温.mkv",
+    ] {
+        let r = p(name);
+        assert_eq!(r.episode, Some(if name.contains(".02.") { 2 } else { 1 }));
+        assert!(r.episode_marker, "{name} 的集号应算明确标记（{r:?}）");
+        assert_eq!(r.season, Some(1), "{name} 无季号时按第 1 季（{r:?}）");
+        assert_eq!(r.title, "西游记", "{name} 标题要截断在集号前（{r:?}）");
+    }
+    // 明确标记优先，结论不变
+    let r = p("西游记.E01.猴王初问世.mp4");
+    assert_eq!(r.episode, Some(1));
+    assert_eq!(r.title, "西游记");
+}
+
+/// 数字**结尾**的裸编号（`剧名 01.mkv`）刻意不在这里认——
+/// 那是系列电影 / 拆部电影的形状，判定层要靠「目录编号共识」兜（R8）。
+#[test]
+fn trailing_bare_number_stays_unmarked_for_folder_consensus() {
+    for name in ["剧名 01.mkv", "剧名.01.mkv", "01.mkv"] {
+        let r = p(name);
+        assert_eq!(r.episode, None, "{name} 不该被当成明确集号（{r:?}）");
+        assert!(!r.episode_marker, "{name} 不该有集号标记（{r:?}）");
+    }
+}
+
+/// 版本区间 `1986-2000版` 取起始年，且整段不算标题。
+#[test]
+fn year_range_is_a_version_marker_not_a_year_tail() {
+    let r = p("西游记1986-2000版.01.猴王初问世.mp4");
+    assert_eq!(r.year, Some(1986), "应取区间起始年，实际：{r:?}");
+    assert_eq!(r.episode, Some(1));
+    assert_eq!(r.title, "西游记", "版本区间不能留在标题里，实际：{r:?}");
+}
+
+/// 安全阀门：片名里的数字后紧跟汉字时**不能**被当成集号。
+#[test]
+fn numbers_inside_a_movie_title_are_not_episodes() {
+    for (name, title) in [
+        ("50度灰.2015.mp4", "50度灰"),
+        ("300勇士.2006.mp4", "300勇士"),
+        ("12怒汉.1957.mp4", "12怒汉"),
+        ("007：大破天幕杀机.2012.mp4", "007：大破天幕杀机"),
+    ] {
+        let r = p(name);
+        assert_eq!(r.episode, None, "{name} 不能被当成单集（{r:?}）");
+        assert!(!r.episode_marker, "{name} 不该有集号标记");
+        assert_eq!(r.title, title, "{name} 标题应完整保留（{r:?}）");
+    }
+}
+
+/// 清晰度 / 编码里的数字同样不是集号（`1080p` `x264` `720p`）。
+#[test]
+fn quality_and_codec_numbers_are_not_episodes() {
+    for name in [
+        "Some.Movie.1080p.2018.mkv",
+        "Some.Movie.720p.BluRay.x264.mkv",
+        "Show.S02.1080p.WEB-DL.mkv",
+        "Interstellar.2014.1080p.BluRay.x264.DTS-FGT.mkv",
+        "Title.2020.10bit.mkv",
+    ] {
+        let r = p(name);
+        assert_eq!(r.episode, None, "{name} 不该被认成单集（{r:?}）");
+    }
+}
+
+/// 纯 4 位编号（`哆啦A梦 1000`）依旧不算集号——那是集数上千的老番编号。
+#[test]
+fn four_digit_number_is_still_not_an_episode() {
+    let r = p("哆啦A梦 1000.mp4");
+    assert_eq!(r.episode, None, "4 位编号不进裸集号规则（{r:?}）");
+}
+
+/* --------------------- TMDB 识别码（优先于标题/年份/分辨率） --------------------- */
+
+/// 常见写法都要认：忽略大小写、忽略分隔符差异（`tmdbid` 也算一种关键字）。
+#[test]
+fn tmdb_id_markers_are_recognized_across_writings() {
+    for (name, want) in [
+        ("Movie.Name.2013.tmdb-123456.mkv", 123456i64),
+        ("Movie.Name.tmdbid:123456.mkv", 123456),
+        ("Movie.Name.[tmdb=123456].mkv", 123456),
+        ("Movie.Name.(tmdb 123456).mkv", 123456),
+        ("Movie.Name.{tmdb_123456}.mkv", 123456),
+        ("Movie.Name.TMDB.123456.mkv", 123456),
+        ("Movie.Name.tmdb123456.mkv", 123456),
+        ("Movie.Name.TmdbId = 123456.mkv", 123456),
+        ("Movie.Name.tmdbid-7.mkv", 7),
+    ] {
+        assert_eq!(
+            extract_tmdb_id(name),
+            Some(want),
+            "{name} 应解析出 TMDB id {want}"
+        );
+        assert_eq!(p(name).tmdb_id, Some(want), "{name} 走 parse_file_name 也要一致");
+    }
+}
+
+/// 没有 `tmdb` 关键字的裸数字**一律不算** id——这是防误伤的核心。
+#[test]
+fn plain_numbers_are_never_tmdb_ids() {
+    for name in [
+        "2012.2009.1080p.mkv",
+        "Se7en.1995.1080p.BluRay.x264.mkv",
+        "Show.S01E01.1080p.mkv",
+        "1917.2019.mkv",
+        "第01集.mkv",
+        "300勇士.2006.mkv",
+        "50度灰.2015.mkv",
+        "12怒汉.1957.mkv",
+    ] {
+        assert_eq!(extract_tmdb_id(name), None, "{name} 不该凭数字认出 TMDB id");
+    }
+}
+
+/// 分辨率伪装：`tmdb 1080p` 里的 `1080` 后面紧跟 `p`，不算 id。
+#[test]
+fn resolution_masquerading_as_tmdb_id_is_rejected() {
+    assert_eq!(extract_tmdb_id("Movie.tmdb.1080p.mkv"), None);
+    assert_eq!(extract_tmdb_id("Movie.tmdb 720p.mkv"), None);
+    assert_eq!(extract_tmdb_id("Movie.tmdb-2160p.mkv"), None);
+    // 真正的 id 不能被这条规则误杀
+    assert_eq!(extract_tmdb_id("Movie.tmdb-1080.mkv"), Some(1080));
+}
+
+/// 多文本按传入顺序取第一个命中的——顺序即优先级。
+#[test]
+fn tmdb_id_from_texts_follows_priority_order() {
+    let file_name = "言叶之庭.tmdbid:42.1080p.mkv";
+    let title = "别的东西 tmdb-999";
+    assert_eq!(tmdb_id_from_texts(&[file_name, title]), Some(42));
+    assert_eq!(tmdb_id_from_texts(&[title, file_name]), Some(999));
+    assert_eq!(tmdb_id_from_texts(&["没线索的标题", "2013"]), None);
+    assert_eq!(tmdb_id_from_texts(&[]), None);
+}
+
+/// 命中 id 的同时，标题 / 年份 / 集号这些**照常解析**——只是匹配依据换成 id。
+#[test]
+fn tmdb_id_does_not_disturb_other_parsing() {
+    let r = p("Show.Name.S01E02.tmdb-555.1080p.mkv");
+    assert_eq!(r.tmdb_id, Some(555));
+    assert_eq!(r.season, Some(1));
+    assert_eq!(r.episode, Some(2));
+    assert_eq!(r.title, "Show Name");
+}

@@ -11,10 +11,12 @@
 import { computed, ref } from "vue";
 import { useCategoryStore } from "../stores/categoryStore";
 import {
-  categoryView, tagView, VIEW_ALL, VIEW_COLLECTIONS, VIEW_MOVIE, VIEW_SETTINGS,
+  categoryView, tagView, VIEW_ALL, VIEW_CATALOG, VIEW_MOVIE, VIEW_SETTINGS,
   VIEW_TV, VIEW_UNKNOWN, VIEW_UNCLASSIFIED, type ViewKey,
 } from "../types";
 import { MEDIA_TYPE_ICON } from "../constants/mediaType";
+import { askConfirm } from "../utils/confirm";
+import CollapsibleSection from "./CollapsibleSection.vue";
 
 const props = defineProps<{ modelValue: ViewKey }>();
 const emit = defineEmits<{ (e: "update:modelValue", v: ViewKey): void }>();
@@ -27,8 +29,10 @@ const entries: { key: ViewKey; label: string; icon: string }[] = [
   { key: VIEW_TV, label: "剧集", icon: MEDIA_TYPE_ICON.tv },
   // 判定不出类型的条目单独放一栏：不再让它们无声无息地混进「电影」。
   { key: VIEW_UNKNOWN, label: "待确认", icon: MEDIA_TYPE_ICON.unknown },
-  // 同一系列 / IP 的电影归到一起（派生视图，按上映时间排序）。
-  { key: VIEW_COLLECTIONS, label: "系列合集", icon: "🎞" },
+  // 资源目录库：磁盘资源的持久化清单，用来对比每次检测、定位被挪走 / 删除的旧文件。
+  { key: VIEW_CATALOG, label: "资源目录库", icon: "🗄" },
+  // 注：剧集层级不再单列栏目——层级本身（`parent_id`）还在库里，
+  // 现在由封面墙用「聚合分组」呈现，避免两套入口维护两套状态。
 ];
 
 /* --------------------------- 分类的就地管理 --------------------------- */
@@ -38,8 +42,14 @@ const newName = ref("");
 /** 正在改名的分类 id（null 表示没有）。 */
 const editingId = ref<number | null>(null);
 const editingName = ref("");
-/** 展开标签区（标签多的时候不占满侧栏）。 */
-const tagsOpen = ref(false);
+/**
+ * 「分类」「标签」两栏各自的展开状态。
+ *
+ * 两栏**互不干涉**：收起分类不应影响标签，反之亦然。默认都是展开的——
+ * 侧栏是主导航，藏起来等于让人找不到入口。
+ */
+const catOpen = ref(true);
+const tagsOpen = ref(true);
 
 const sortedCategories = computed(() => [...cat.categories]);
 
@@ -74,7 +84,7 @@ async function submitEdit(): Promise<void> {
 }
 
 async function remove(id: number, name: string): Promise<void> {
-  if (!window.confirm(`删除分类「${name}」？\n影视本身会保留，只是解除归类。`)) return;
+  if (!(await askConfirm(`删除分类「${name}」？\n影视本身会保留，只是解除归类。`, "删除分类"))) return;
   const ok = await cat.removeCategory(id);
   // 正在看这个分类时退回「全部」，否则会停在一个已不存在的栏目上
   if (ok && props.modelValue === categoryView(id)) go(VIEW_ALL);
@@ -96,11 +106,11 @@ async function remove(id: number, name: string): Promise<void> {
         ><span class="ico">{{ e.icon }}</span>{{ e.label }}</button>
       </nav>
 
-      <div class="group">
-        <div class="group-head">
-          <span>分类</span>
+      <!-- 分类栏：可折叠，默认展开。右侧的「＋」是新建，点它不该把栏收起来 -->
+      <CollapsibleSection v-model:open="catOpen" title="分类" class="group">
+        <template #extra>
           <button class="plus" title="新建分类" @click="adding = !adding">＋</button>
-        </div>
+        </template>
 
         <div v-if="adding" class="row">
           <input
@@ -148,28 +158,23 @@ async function remove(id: number, name: string): Promise<void> {
           :class="{ active: modelValue === 'unclassified' }"
           @click="go(VIEW_UNCLASSIFIED)"
         ><span class="ico">❔</span>未分类</button>
-      </div>
+      </CollapsibleSection>
 
-      <div class="group">
-        <div class="group-head">
-          <span>标签</span>
-          <button class="plus" @click="tagsOpen = !tagsOpen">{{ tagsOpen ? "−" : "＋" }}</button>
-        </div>
-        <template v-if="tagsOpen">
-          <button
-            v-for="t in cat.tags"
-            :key="t.id"
-            class="item"
-            :class="{ active: tagView(t.id) === modelValue }"
-            @click="go(tagView(t.id))"
-          >
-            <span class="ico">🏷</span>
-            <span class="name">{{ t.name }}</span>
-            <span class="count">{{ t.usageCount }}</span>
-          </button>
-          <p v-if="!cat.tags.length" class="empty">还没有标签（可在详情页添加）</p>
-        </template>
-      </div>
+      <!-- 标签栏：与分类栏各自独立，互不影响 -->
+      <CollapsibleSection v-model:open="tagsOpen" title="标签" class="group">
+        <button
+          v-for="t in cat.tags"
+          :key="t.id"
+          class="item"
+          :class="{ active: tagView(t.id) === modelValue }"
+          @click="go(tagView(t.id))"
+        >
+          <span class="ico">🏷</span>
+          <span class="name">{{ t.name }}</span>
+          <span class="count">{{ t.usageCount }}</span>
+        </button>
+        <p v-if="!cat.tags.length" class="empty">还没有标签（可在详情页添加）</p>
+      </CollapsibleSection>
     </div>
 
     <button
@@ -195,10 +200,14 @@ async function remove(id: number, name: string): Promise<void> {
 /* 分类可能很多，让中间区域自己滚，设置按钮始终留在底部 */
 .scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: calc(var(--space) * 2); }
 .nav { display: flex; flex-direction: column; gap: 2px; }
-.group { display: flex; flex-direction: column; gap: 2px; margin-top: calc(var(--space) * 2); }
-.group-head {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 6px 12px 4px; font-size: var(--fs-12); color: var(--muted); letter-spacing: .5px;
+/*
+ * 分组容器：这里只定**间距和标题字号**，折叠的头部结构与动画都在
+ * `CollapsibleSection.vue` 里（scoped 样式穿不进子组件，所以别在这写 .group-head）。
+ * 字号/颜色写在容器上，由折叠组件继承，两栏风格才跟侧栏一致。
+ */
+.group {
+  margin-top: calc(var(--space) * 2);
+  font-size: var(--fs-12); color: var(--muted); letter-spacing: 0.5px;
 }
 .plus {
   border: 0; background: none; color: var(--muted); cursor: pointer;

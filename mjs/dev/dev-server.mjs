@@ -10,13 +10,14 @@
 //      用「已经跑起来的那个 node」自己启动，不再二次查找可执行文件。
 //
 // 用法：
-//   node scripts/dev-server.mjs
+//   node mjs/dev/dev-server.mjs
 import { createServer } from "vite";
 
 const PORT = Number(process.env.TAURI_DEV_PORT || 1420);
 
 const server = await createServer({
-  configFile: new URL("../vite.config.ts", import.meta.url).pathname,
+  // 本文件在 <项目根>/mjs/dev/ 下，vite.config.ts 在项目根，要上溯两级。
+  configFile: new URL("../../vite.config.ts", import.meta.url).pathname,
   server: { port: PORT, strictPort: true },
 });
 

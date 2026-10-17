@@ -15,7 +15,14 @@ import { useCategoryStore } from "../stores/categoryStore";
 import { useMediaStore } from "../stores/mediaStore";
 import type { MediaItem, MediaType } from "../api/commands";
 
-const props = defineProps<{ initial: MediaItem | null }>();
+/**
+ * `parentId` 只有从**层级视图**里新建时才传：非 `undefined` 表示要建在某个剧集内部，
+ * 此时类型默认按「剧集」，建完还要顺手刷新层级数据。
+ */
+const props = defineProps<{
+  initial: MediaItem | null;
+  parentId?: number | null;
+}>();
 const emit = defineEmits<{ (e: "close"): void }>();
 
 const media = useMediaStore();
@@ -24,7 +31,9 @@ const cat = useCategoryStore();
 const isEdit = computed(() => props.initial !== null);
 
 const title = ref(props.initial?.title ?? "");
-const mediaType = ref<MediaType>(props.initial?.type ?? "movie");
+const mediaType = ref<MediaType>(
+  props.initial?.type ?? (props.parentId !== undefined ? "tv" : "movie"),
+);
 const year = ref<number | null>(props.initial?.year ?? null);
 const genre = ref(props.initial?.genre ?? "");
 const overview = ref(props.initial?.overview ?? "");
@@ -94,10 +103,14 @@ async function submit(): Promise<void> {
           overview: overview.value,
           categoryIds: picked.value,
           tagNames: tagNames(),
+          parentId: props.parentId ?? null,
         });
     if (done) {
       // 分类 / 标签的计数可能变了，刷新侧栏
       await cat.load();
+      // 指定了父节点的新建：重拉一次列表，让封面墙上的聚合分组立刻长出新节点
+      // （剧集层级视图已撤掉，层级关系现在只在封面墙里呈现）
+      if (props.parentId !== undefined) await media.load();
       emit("close");
     } else {
       err.value = media.error ?? (isEdit.value ? "更新失败" : "新建失败");

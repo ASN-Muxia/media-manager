@@ -43,12 +43,17 @@
 //! 两种情况下都遵守同一条铁律：**只补缺失，绝不覆盖**。
 
 use crate::commands::catalog;
+use crate::commands::job::{self, JobProgress};
 use super::control::ScrapeControl;
+use crate::core::matching::{self, Candidate, MatchOptions, MatchQuery};
 use crate::commands::settings::{
     load_auto_scrape, load_douban_config, load_fanart_key, load_hosts, load_llm_config,
-    load_omdb_key, load_tmdb_key, load_tmdb_language, load_tvdb_key,
+    load_match_limit, load_match_options, load_omdb_key, load_tmdb_key, load_tmdb_language,
+    load_tvdb_key,
 };
 use crate::store::db::now_epoch;
+use crate::store::cache;
+use crate::provider::registry::{FANART as PROVIDER_FANART, OMDB as PROVIDER_OMDB, TMDB as PROVIDER_TMDB, TVDB as PROVIDER_TVDB, DOUBAN as PROVIDER_DOUBAN};
 use crate::provider::douban::{DoubanClient, DoubanMeta};
 use crate::provider::fanart::{Art, FanartClient};
 use crate::provider::llm::LlmConfig;
@@ -170,11 +175,22 @@ pub struct Providers {
     pub llm: LlmConfig,
     /// 自定义 hosts 映射（所有客户端共用）。
     pub hosts: Vec<String>,
+    /// TMDb 是否可用。**两种情况下都不可用**：没配 Key，或用户在设置里关掉了它。
+    /// 关掉时整条链路会走豆瓣接管，而不是报错。
+    pub tmdb_on: bool,
 }
 
 impl Providers {
     /// 从设置里装配。Key 为空的 provider 直接缺席，不报错。
+    ///
+    /// 「Key 为空」与「用户关掉了」是两件事，这里统一处理：
+    /// 注册表（`provider::registry`）只回答「哪些源开着」，**权威顺序不变**（B5）——
+    /// 关掉一个源不会让后面的源提前，也不会让别的源去顶它的位置。
     pub fn load(conn: &Connection, tmdb_key: &str, hosts: Vec<String>, language: &str) -> Self {
+        let disabled = crate::commands::settings::load_disabled_providers(conn);
+        let on = crate::provider::registry::enabled_order(&disabled);
+        let is_on = |id: &str| on.iter().any(|x| *x == id);
+
         let tvdb_key = load_tvdb_key(conn);
         let fanart_key = load_fanart_key(conn);
         let omdb_key = load_omdb_key(conn);
@@ -183,25 +199,22 @@ impl Providers {
         let fanart = FanartClient::with_hosts(fanart_key, &hosts);
         let omdb = OmdbClient::with_hosts(omdb_key, &hosts);
         // 豆瓣没有 Key，靠开关控制；关了就让步骤整段跳过。
-        let douban = DoubanClient::with_hosts(douban_enabled, douban_cookie, &hosts);
+        let douban = DoubanClient::with_hosts(douban_enabled && is_on(PROVIDER_DOUBAN), douban_cookie, &hosts);
+        let tmdb_on = !tmdb_key.trim().is_empty() && is_on(PROVIDER_TMDB);
         Providers {
             tmdb: TmdbClient::with_hosts_and_language(tmdb_key, &hosts, language),
-            tvdb: if tvdb.enabled() { Some(tvdb) } else { None },
-            fanart: if fanart.enabled() { Some(fanart) } else { None },
-            omdb: if omdb.enabled() { Some(omdb) } else { None },
+            tvdb: if tvdb.enabled() && is_on(PROVIDER_TVDB) { Some(tvdb) } else { None },
+            fanart: if fanart.enabled() && is_on(PROVIDER_FANART) { Some(fanart) } else { None },
+            omdb: if omdb.enabled() && is_on(PROVIDER_OMDB) { Some(omdb) } else { None },
             douban: if douban.enabled() { Some(douban) } else { None },
             llm: load_llm_config(conn),
             hosts,
+            tmdb_on,
         }
     }
 
     fn has_tvdb(&self) -> bool {
         self.tvdb.is_some()
-    }
-
-    /// 是否配了 TMDB Key。没配时豆瓣要承担**整条接管**的角色。
-    fn has_tmdb(&self, tmdb_key: &str) -> bool {
-        !tmdb_key.trim().is_empty()
     }
 }
 
@@ -212,13 +225,16 @@ struct PendingRow {
     year: Option<i32>,
     /// 用于脏文件名兜底解析的**原始文件名**（剧集取第一集的文件名）。
     file_name: Option<String>,
+    /// 入库时从文件名里解析出来的 TMDB 识别码（`{tmdb-123456}` 这类写法）。
+    tmdb_id: Option<i64>,
 }
 
 fn read_pending(conn: &Connection, id: i64) -> Result<PendingRow, String> {
     conn.query_row(
         "SELECT id, type, title, year, \
                 COALESCE(file_name, (SELECT e.file_name FROM episodes e \
-                    WHERE e.media_id = media.id ORDER BY e.season, e.episode LIMIT 1)) \
+                    WHERE e.media_id = media.id ORDER BY e.season, e.episode LIMIT 1)), \
+                tmdb_id \
          FROM media WHERE id = ?1",
         params![id],
         |r| {
@@ -227,6 +243,7 @@ fn read_pending(conn: &Connection, id: i64) -> Result<PendingRow, String> {
                 title: r.get(2)?,
                 year: r.get(3)?,
                 file_name: r.get(4)?,
+                tmdb_id: r.get(5)?,
             })
         },
     )
@@ -279,7 +296,8 @@ fn fill_episodes(
 
     let mut updated = 0i64;
     for season in seasons {
-        let Ok(list) = client.season_episodes(tv_id, season) else {
+        // 整季的单集列表也进缓存：同一季反复刮不再重复联网
+        let Ok(list) = cached_season_episodes(conn, client, tv_id, season) else {
             continue;
         };
         for ep in list {
@@ -311,7 +329,114 @@ fn fill_episodes(
 }
 
 /// 按标题 + 年份在 TMDB 里挑一个最合适的 id（优先同年份，其次第一条）。
+/* --------------------------- 元数据缓存（旁路） --------------------------- */
+/* 缓存在**命令层**旁路读写，provider 自己的函数签名、优先级顺序、返回类型都不动（B5）。
+   命中就省一次网络请求；未命中与加缓存之前完全一样。
+   两条纪律：只缓存**成功**响应（一次网络抖动不该被记住好几天）、
+   key 必须带 provider 名（否则 TMDb 与豆瓣的同名查询会互相串数据）。 */
+
+/// 拼一个稳定的缓存 key。各字段用 `|` 分隔并转义，避免 `a|b` 与 `a` + `b` 撞车。
+fn cache_key(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|p| p.replace('|', "%7C"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// 带缓存的 TMDb 详情。
+fn cached_detail(
+    conn: &Connection,
+    client: &TmdbClient,
+    media_type: &str,
+    tmdb_id: i64,
+) -> Result<crate::provider::tmdb::TmdbMeta, String> {
+    let key = cache_key(&["detail", media_type, &tmdb_id.to_string()]);
+    if let Some(payload) = cache::get(conn, PROVIDER_TMDB, &key) {
+        if let Ok(meta) = serde_json::from_str(&payload) {
+            return Ok(meta);
+        }
+        // 反序列化失败（结构升级过）→ 当作 miss，继续联网，不报错
+    }
+    let meta = client.detail(media_type, tmdb_id)?;
+    if let Ok(s) = serde_json::to_string(&meta) {
+        let _ = cache::put(conn, PROVIDER_TMDB, &key, &s, cache::DEFAULT_TTL);
+    }
+    Ok(meta)
+}
+
+/// 带缓存的「一季的单集列表」。
+fn cached_season_episodes(
+    conn: &Connection,
+    client: &TmdbClient,
+    tv_id: i64,
+    season: i64,
+) -> Result<Vec<crate::provider::tmdb::TmdbEpisodeItem>, String> {
+    let key = cache_key(&["season", &tv_id.to_string(), &season.to_string()]);
+    if let Some(payload) = cache::get(conn, PROVIDER_TMDB, &key) {
+        if let Ok(list) = serde_json::from_str(&payload) {
+            return Ok(list);
+        }
+    }
+    let list = client.season_episodes(tv_id, season)?;
+    if let Ok(s) = serde_json::to_string(&list) {
+        let _ = cache::put(conn, PROVIDER_TMDB, &key, &s, cache::DEFAULT_TTL);
+    }
+    Ok(list)
+}
+
+/// 带缓存的 TMDb 检索。
+fn cached_search(
+    conn: &Connection,
+    client: &TmdbClient,
+    media_type: &str,
+    title: &str,
+    year: Option<i32>,
+) -> Option<Vec<crate::provider::tmdb::TmdbSearchItem>> {
+    let ys = year.map(|y| y.to_string()).unwrap_or_default();
+    let key = cache_key(&["search", media_type, title, &ys]);
+    if let Some(payload) = cache::get(conn, PROVIDER_TMDB, &key) {
+        if let Ok(items) = serde_json::from_str(&payload) {
+            return Some(items);
+        }
+    }
+    let items = client.search(media_type, title, year).ok()?;
+    if let Ok(s) = serde_json::to_string(&items) {
+        let _ = cache::put(conn, PROVIDER_TMDB, &key, &s, cache::DEFAULT_TTL);
+    }
+    Some(items)
+}
+
+/// 从「文本里已经写明的身份线索」确定 TMDB id（纯函数，不联网、不查库）。
+///
+/// ## 优先级（从高到低，命中即返回）
+///
+/// 1. `explicit` —— 调用方显式指定（手动匹配里用户勾选的那一条）；
+/// 2. `stored` —— 入库时从文件名解析出来的（扫描时 `parse_stem` 已写入 `media.tmdb_id`）；
+/// 3. 从 `file_name` → `title` 现解析一次（`tmdbid:123456` 这类写法，
+///    老数据入库时旧版正则没认出来，这里补一次）。
+///
+/// 命中任何一个都**直接作为唯一匹配依据**，不再走基于标题 + 年份的检索式
+/// 模糊匹配（`pick_tmdb_id`）。返回 `None` 才表示「文本里没有身份线索，该回退了」，
+/// 此时原有流程与输出格式完全不变。
+fn tmdb_id_from_evidence(
+    explicit: Option<i64>,
+    stored: Option<i64>,
+    file_name: Option<&str>,
+    title: &str,
+) -> Option<i64> {
+    explicit.or(stored).or_else(|| {
+        let mut texts: Vec<&str> = Vec::with_capacity(2);
+        if let Some(f) = file_name {
+            texts.push(f);
+        }
+        texts.push(title);
+        crate::core::parser::tmdb_id_from_texts(&texts)
+    })
+}
+
 fn pick_tmdb_id(
+    conn: &Connection,
     client: &TmdbClient,
     media_type: &str,
     title: &str,
@@ -320,9 +445,7 @@ fn pick_tmdb_id(
     if title.trim().is_empty() {
         return None;
     }
-    client
-        .search(media_type, title, year)
-        .ok()
+    cached_search(conn, client, media_type, title, year)
         .and_then(|items| {
             items
                 .iter()
@@ -796,7 +919,6 @@ fn refine_title_with_llm(p: &Providers, conn: &Connection, id: i64, pending: &Pe
 fn douban_takeover(
     conn: &Connection,
     p: &Providers,
-    tmdb_key: &str,
     id: i64,
     pending: PendingRow,
     refined: Option<(String, Option<i32>)>,
@@ -810,11 +932,12 @@ fn douban_takeover(
     let year = llm_year.or(pending.year);
     let media_type = pending.media_type.clone();
 
-    // 没配 TMDb Key 时，豆瓣是**主力**而不是兜底，失败提示要换个说法
-    let miss_message = if p.has_tmdb(tmdb_key) {
+    // TMDb 不可用（没配 Key，或用户在设置里关掉了）时，豆瓣是**主力**而不是兜底，
+    // 失败提示要换个说法 —— 否则用户会去 TMDB 那边白找一圈。
+    let miss_message = if p.tmdb_on {
         "未在 TMDB 找到匹配条目".to_string()
     } else {
-        "尚未配置 TMDB API Key，且未在豆瓣找到匹配条目".to_string()
+        "TMDb 未启用（没配 Key 或已关闭），且未在豆瓣找到匹配条目".to_string()
     };
 
     let Some(client) = p.douban.as_ref() else {
@@ -893,39 +1016,51 @@ fn persist_llm_hint(conn: &Connection, id: i64, title: &Option<String>, year: Op
 
 /// 刮削一条记录并回填。**纯后台逻辑**，调用方必须保证不在主线程上跑。
 ///
-/// `tmdb_key` 只用于判断"有没有 TMDb 主源"（决定豆瓣是主力还是兜底、以及失败提示语），
-/// 真正的 TMDb 客户端在 `p.tmdb` 里。
+/// 「TMDb 能不能用」由 `p.tmdb_on` 统一回答（配了 Key **且**没被用户在设置里关掉）——
+/// 不再单独收一个 `tmdb_key` 参数，避免出现「调用方传的 Key」与
+/// 「装配 provider 时读到的设置」两个真相来源。
 fn scrape_one(
     conn: &Connection,
     p: &Providers,
-    tmdb_key: &str,
     id: i64,
     tmdb_id: Option<i64>,
 ) -> Result<ScrapeOutcome, String> {
     let pending = read_pending(conn, id)?;
 
     // 1) 确定 TMDB id（TMDb 永远是第一步，也是权威来源）
-    let mut resolved = match tmdb_id {
-        Some(t) => Some(t),
-        None => pick_tmdb_id(&p.tmdb, &pending.media_type, &pending.title, pending.year),
+    //
+    // 用户关掉 TMDb（或没配 Key）时整段跳过，直接落到下面的豆瓣接管分支——
+    // 不是报错，而是把豆瓣当成主力（`p.tmdb_on` 会决定提示语怎么说）。
+    let mut resolved = if !p.tmdb_on {
+        None
+    } else {
+        // 显式指定 / 入库时解析的 / 文本里现解析的 → 命中就用，
+        // 完全跳过下面的「标题 + 年份检索」模糊匹配。
+        tmdb_id_from_evidence(
+            tmdb_id,
+            pending.tmdb_id,
+            pending.file_name.as_deref(),
+            &pending.title,
+        )
+        .or_else(|| pick_tmdb_id(conn, &p.tmdb, &pending.media_type, &pending.title, pending.year))
     };
     // 1b) 识别失败才轮到可选增强：大模型把脏文件名翻成人话，再重试一次检索
+    // （TMDb 关着就没必要重试了——重试的目标就是它）
     let mut refined: Option<(String, Option<i32>)> = None;
-    if resolved.is_none() {
+    if resolved.is_none() && p.tmdb_on {
         if let Some(r) = refine_title_with_llm(p, conn, id, &pending) {
-            resolved = pick_tmdb_id(&p.tmdb, &pending.media_type, &r.0, r.1);
+            resolved = pick_tmdb_id(conn, &p.tmdb, &pending.media_type, &r.0, r.1);
             refined = Some(r);
         }
     }
 
     let Some(tmdb_id) = resolved else {
         // 连大模型也救不回来 → 交给豆瓣做**整条接管**兜底（若已启用）
-        // 注意这里仍要带上 tmdb_key，用于判断"有没有 TMDb 主源"以决定提示语
-        return douban_takeover(conn, p, tmdb_key, id, pending, refined);
+        return douban_takeover(conn, p, id, pending, refined);
     };
 
-    // 2) 取详情并回填
-    let meta = p.tmdb.detail(&pending.media_type, tmdb_id)?;
+    // 2) 取详情并回填（走缓存：同一个 tmdb_id 反复刮不会反复联网）
+    let meta = cached_detail(conn, &p.tmdb, &pending.media_type, tmdb_id)?;
     update_meta(conn, id, tmdb_id, &meta)?;
     // 2b) TMDb 认出来的类型 ↔ 左侧栏目保持同步（失败不影响刮削结果）
     if let Some(genre) = meta.genre.as_deref() {
@@ -1000,35 +1135,128 @@ fn read_title(conn: &Connection, id: i64) -> String {
 
 /* --------------------------- 命令 --------------------------- */
 
+/// 手动匹配允许的上限：再大就是拿一个泛关键词把整个库翻一遍了。
+const MATCH_MAX_LIMIT: usize = matching::MAX_LIMIT;
+/// 最多翻几页。
+const MATCH_MAX_PAGES: u32 = 10;
+
 /// 搜索 TMDB 候选（供详情页手动匹配）。
+///
+/// 返回类型**保持** `Vec<TmdbSearchItem>`：新增的 `match_score` /
+/// `match_reasons` 是可选字段，老调用方按 `?.` 取、取不到也不影响。
+///
+/// 与旧版的差别只在「给什么、按什么顺序给」：
+/// 1. 检索词先剥掉技术标签（`1080p` / `x265` 不该进检索词）；
+/// 2. 一次拉多页并去重，条数从 20 放宽到 `MATCH_DEFAULT_LIMIT`；
+/// 3. 本地原标题 / 别名参与比对（多语言片名的关键）；
+/// 4. 按 [`matching`] 的打分排序，黑名单命中的整条剔除。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn search_tmdb(
     state: State<'_, Mutex<Connection>>,
     media_type: String,
     query: String,
     year: Option<i32>,
+    original_title: Option<String>,
+    season: Option<i32>,
+    limit: Option<usize>,
+    fuzzy: Option<bool>,
+    year_tolerance: Option<i32>,
+    blacklist: Option<String>,
 ) -> Result<Vec<TmdbSearchItem>, String> {
-    let (key, hosts, language) = {
+    let (key, hosts, language, base_opts, base_limit) = {
         let conn = state.lock().map_err(|e| e.to_string())?;
         (
             load_tmdb_key(&conn),
             load_hosts(&conn),
             load_tmdb_language(&conn),
+            load_match_options(&conn),
+            load_match_limit(&conn),
         )
     };
     if key.trim().is_empty() {
         return Err("尚未配置 TMDB API Key，请先到「设置」填写".to_string());
     }
+
+    // 清洗检索词：技术标签对 TMDB 毫无意义，只会干扰检索
+    let cleaned = matching::strip_tech_tags(&query);
+    let query = if cleaned.trim().is_empty() {
+        query.trim().to_string()
+    } else {
+        cleaned
+    };
+
+    let mut aliases: Vec<String> = Vec::new();
+    if let Some(o) = original_title {
+        let o = o.trim().to_string();
+        if !o.is_empty() && matching::fold(&o) != matching::fold(&query) {
+            aliases.push(o);
+        }
+    }
+
+    let opts = MatchOptions {
+        fuzzy: fuzzy.unwrap_or(base_opts.fuzzy),
+        year_tolerance: year_tolerance.unwrap_or(base_opts.year_tolerance).max(0),
+        blacklist: blacklist
+            .as_deref()
+            .map(matching::split_blacklist)
+            .unwrap_or(base_opts.blacklist),
+        min_score: base_opts.min_score,
+        weights: base_opts.weights,
+    };
+    let mq = MatchQuery {
+        title: query.clone(),
+        aliases,
+        year,
+        season,
+        resolution: None,
+    };
+    let want = limit
+        .unwrap_or(base_limit)
+        .clamp(1, MATCH_MAX_LIMIT);
+    let client = TmdbClient::with_hosts_and_language(key, &hosts, &language);
+
     // 网络请求挪到后台线程，主线程继续响应界面。
-    tauri::async_runtime::spawn_blocking(move || {
-        TmdbClient::with_hosts_and_language(key, &hosts, &language).search(
-            &media_type,
-            &query,
-            year,
-        )
+    let items = tauri::async_runtime::spawn_blocking(move || {
+        let mut items = client
+            .search_many(&media_type, &query, year, want, MATCH_MAX_PAGES)
+            .unwrap_or_default();
+        // 带上年份检索可能因为本地年份不准而一无所获：退一步再试一次。
+        if items.is_empty() && year.is_some() {
+            items = client
+                .search_many(&media_type, &query, None, want, MATCH_MAX_PAGES)
+                .unwrap_or_default();
+        }
+        items
     })
     .await
-    .map_err(|e| format!("搜索任务异常退出: {e}"))?
+    .map_err(|e| format!("搜索任务异常退出: {e}"))?;
+
+    // 打分 → 过滤 → 排序（同分保持 TMDB 原来的顺序，避免结果跳来跳去）
+    let mut ranked: Vec<(TmdbSearchItem, matching::MatchScore)> = Vec::new();
+    for it in items {
+        let disp = it.display_title();
+        let orig = it.original().map(|s| s.to_string());
+        let cand = Candidate {
+            primary: &disp,
+            original: orig.as_deref(),
+            year: crate::provider::tmdb::year_from_date(it.date().as_deref()),
+            vote: it.vote_average,
+        };
+        let s = matching::score_candidate(&mq, &opts, &cand);
+        if matching::keeps(&s, &opts) {
+            ranked.push((it, s));
+        }
+    }
+    ranked.sort_by(|a, b| b.1.score.cmp(&a.1.score));
+    Ok(ranked
+        .into_iter()
+        .map(|(mut it, s)| {
+            it.match_score = Some(s.score);
+            it.match_reasons = Some(s.reasons);
+            it
+        })
+        .collect())
 }
 
 /// 刮削单条：给了 `tmdb_id` 就直接取详情，否则按标题+年份自动匹配第一条。
@@ -1060,7 +1288,7 @@ pub async fn scrape_media(
         let conn = crate::store::db::open(&app).map_err(|e| format!("打开数据库失败: {e}"))?;
         // 后台线程自己读设置装配 provider，不占主线程的连接锁
         let providers = Providers::load(&conn, &key, hosts, &language);
-        scrape_one(&conn, &providers, &key, id, tmdb_id)
+        scrape_one(&conn, &providers, id, tmdb_id)
     })
     .await
     .map_err(|e| format!("刮削任务异常退出: {e}"))?
@@ -1154,7 +1382,18 @@ fn run_batch(
     ids: Vec<i64>,
 ) {
     let emit = |p: ScrapeProgress| {
+        // 与旧的 scrape-progress **并行**发出（B8：旧事件不删不改）。
+        let job = if p.finished {
+            if p.cancelled {
+                JobProgress::cancelled(job::KIND_SCRAPE, &p.message)
+            } else {
+                JobProgress::done(job::KIND_SCRAPE, &p.message)
+            }
+        } else {
+            JobProgress::tick(job::KIND_SCRAPE, "刮削元数据", p.done, p.total, &p.current)
+        };
         let _ = app.emit(PROGRESS_EVENT, p);
+        job::emit(&app, &job);
     };
 
     let conn = match crate::store::db::open(&app) {
@@ -1177,7 +1416,7 @@ fn run_batch(
         }
         let title = read_title(&conn, id);
         emit(ScrapeProgress::tick(total, ok + failed, ok, failed, title));
-        match scrape_one(&conn, &providers, &key, id, None) {
+        match scrape_one(&conn, &providers, id, None) {
             Ok(r) if r.ok => ok += 1,
             _ => failed += 1,
         }

@@ -97,6 +97,48 @@ export function toggleOne(selected: readonly number[], id: number): number[] {
   return [...selected, id];
 }
 
+/* ==================== 快速滑动 / 首尾项（纯计算，可单测） ==================== */
+/* 指针事件是**稀疏**的：快速划一下，两次 pointermove 之间可能已经跨过好几项，
+   只写"指针正下方那一项"会把中间的整段漏掉（表现为"快速滑动只选中了头尾"）。
+   同理，划到列表外（第一项之上 / 最后一项之下）时下标会越界 ——
+   这里把"补齐"与"夹到端点"两件事做成纯函数，好脱离 DOM 单独钉住。 */
+
+/** 把下标夹到列表合法范围内；列表为空返回 `-1`（没有可夹的项）。 */
+export function clampIndex(index: number, length: number): number {
+  if (length <= 0) return -1;
+  if (index < 0) return 0;
+  if (index > length - 1) return length - 1;
+  return index;
+}
+
+/**
+ * 把 `fromIndex → toIndex` 之间（含两端）的项**一次性**写成目标状态。
+ *
+ * 用于快速滑动：两次移动事件之间被跳过的项，按 `order` 的顺序依次补上，
+ * 结果和"用户老老实实一项一项划过去"完全一致（幂等仍由 `applyDragTo` 保证）。
+ * 两个下标都会被 `clampIndex` 夹住 —— 越界不报错，也不会漏掉首尾项。
+ *
+ * @returns 是否真的发生了变化
+ */
+export function applyDragRange(
+  state: DragSelection,
+  order: readonly number[],
+  fromIndex: number,
+  toIndex: number,
+): boolean {
+  if (!state.active) return false;
+  const from = clampIndex(fromIndex, order.length);
+  const to = clampIndex(toIndex, order.length);
+  if (from < 0 || to < 0) return false;
+  const step = from <= to ? 1 : -1;
+  let changed = false;
+  for (let i = from; ; i += step) {
+    if (applyDragTo(state, order[i])) changed = true;
+    if (i === to) break;
+  }
+  return changed;
+}
+
 /* ==================== 触发判定与边缘滚动（纯计算，可单测） ==================== */
 /* 下面两个函数是「滑动多选」里最容易在改动中被悄悄改坏的部分：
    一个是"这次按下到底算不算拖动"，一个是"贴边滚动该多快"。

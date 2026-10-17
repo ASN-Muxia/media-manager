@@ -12,5 +12,7 @@ pub mod fanart;
 pub mod http;
 pub mod llm;
 pub mod omdb;
+pub mod probe;
+pub mod registry;
 pub mod tmdb;
 pub mod tvdb;

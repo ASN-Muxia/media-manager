@@ -6,10 +6,12 @@
  *
  * 键的构成：
  * - `all` / `movie` / `tv` / `unknown` / `settings`：内置入口（媒体类型快捷筛选，不是分类）
- * - `collections`：系列电影合集（由电影标题算出来的派生视图）
  * - `cat:<id>`：某个分类（id 来自 `categories` 表）
  * - `tag:<id>`：某个标签（id 来自 `tags` 表）
  * - `unclassified`：还没归类的条目
+ *
+ * 注：剧集层级**不是**一个栏目 —— 层级（`parent_id`）保留在数据里，
+ * 由封面墙以「聚合分组」呈现，不再单独占一个视图键。
  */
 export type ViewKey = string;
 
@@ -19,18 +21,25 @@ export type BuiltinView =
   | "movie"
   | "tv"
   | "unknown"
-  | "collections"
-  | "settings";
+  | "settings"
+  | "catalog";
 
 export const VIEW_ALL: ViewKey = "all";
 export const VIEW_MOVIE: ViewKey = "movie";
 export const VIEW_TV: ViewKey = "tv";
 /** 判定不出类型的条目（不再被静默归成电影）。 */
 export const VIEW_UNKNOWN: ViewKey = "unknown";
-/** 系列电影合集。 */
-export const VIEW_COLLECTIONS: ViewKey = "collections";
 export const VIEW_SETTINGS: ViewKey = "settings";
 export const VIEW_UNCLASSIFIED: ViewKey = "unclassified";
+/**
+ * 资源目录库：一份**持久化**的磁盘资源清单（不是媒体条目清单）。
+ *
+ * 与其它内置入口的区别：它不走 mediaStore 的列表查询，而是直接读后端的
+ * resource_assets 表。存在的理由是「每次检测与增量添加时方便对比与定位旧资源」——
+ * 媒体条目只在「识别得出来」时才存在，被挪走 / 改名 / 判不出类型的文件在条目层面
+ * 就消失了，资源清单则一直留着它们最后一次出现的位置。
+ */
+export const VIEW_CATALOG: ViewKey = "catalog";
 
 /** 分类视图键：`cat:<id>`。 */
 export function categoryView(id: number): ViewKey {
@@ -53,8 +62,8 @@ const BUILTINS: BuiltinView[] = [
   "movie",
   "tv",
   "unknown",
-  "collections",
   "settings",
+  "catalog",
 ];
 
 /** 把视图键拆成可判别的结构，避免各处再手写字符串切割。 */

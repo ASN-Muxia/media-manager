@@ -1,0 +1,55 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant A as App.vue
+    participant SS as settingsStore
+    participant API as api/commands.ts
+    participant R as Rust settings.rs
+    participant MS as mediaStore
+    participant S as utils/sort.ts
+    participant G as PosterGrid
+
+    Note over U,G: 阶段一：启动装载（默认值 / 旧库回落）
+    U->>A: 启动应用
+    A->>SS: load()
+    SS->>API: getSettings()
+    API->>R: invoke get_settings
+    R->>R: read_value("sortBy") / ("sortDir")
+    R->>R: normalize_sort(白名单, 回落 "name"/"asc")
+    R-->>SS: { sortBy: "name", sortDir: "asc" }
+    SS->>S: normalizeSortBy / normalizeSortDir（二次兜底）
+    SS-->>A: sortBy / sortDir 就绪
+    A->>MS: load()
+    MS->>API: getMediaList(...)（契约不变，仍无 LIMIT）
+    API-->>MS: MediaItem[]（后端 ORDER BY 不变）
+    MS->>S: buildHanOrder(titles)
+    S->>S: Intl.Collator("zh") 自检 → 排秩（不可用则空表=码点）
+    S-->>MS: HanOrder
+    MS->>S: sortMediaItems(items, "name", "asc", han)
+    S->>S: 逐条 identified() 分区 → 各区排序 → 拼接
+    S-->>MS: orderedItems（已识别 ++ 未识别）
+    MS-->>A: visibleItems()（关键字为空时直接返回）
+    A->>G: :items = visibleItems()
+    G-->>U: 渲染（默认 名称·正序，与升级前方向一致）
+
+    Note over U,G: 阶段二：切换排序（立即重排 + 落库）
+    U->>A: 下拉选「上映 / 首播年份」或点「↑ 正序」
+    A->>S: normalizeSortBy(v)（change 事件）
+    A->>SS: settings.sortBy = "year"（或 sortDir 取反）
+    Note over MS: ref 变更触发 computed 重算（同一帧，无 IPC、无 loading）
+    MS->>S: sortMediaItems(items, "year", "desc", han)
+    S->>S: 分区（不受 dir 影响）→ 分区内主键取反 → 兜底链恒升序
+    S-->>MS: 新 orderedItems
+    MS-->>A: visibleItems() 返回新顺序
+    A->>G: :items（立即重排，未识别区仍在末尾）
+    G-->>U: 列表刷新
+    A->>A: persistSort()
+    alt settings.loaded === true
+        A->>SS: save()
+        SS->>API: setSettings({...含 sortBy/sortDir})
+        API->>R: invoke set_settings
+        R->>R: normalize_sort → write_value（INSERT ON CONFLICT DO UPDATE）
+        R-->>SS: Ok
+    else 落库失败 / 未加载
+        A->>A: catch 并忽略（排序切换不被落库失败打断）
+    end

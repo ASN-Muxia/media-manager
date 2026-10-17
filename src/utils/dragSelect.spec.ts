@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyDragRange,
   applyDragTo,
   beginDragSelection,
+  clampIndex,
   dragTrigger,
   DRAG_THRESHOLD_PX,
   EDGE_MAX_SPEED,
@@ -89,6 +91,151 @@ describe("拖动连续多选", () => {
   it("列表为空时结果必然为空（没有可见的行就没什么可选）", () => {
     expect(finishDragSelection(beginDragSelection([], 10), [])).toEqual([]);
     expect(finishDragSelection(beginDragSelection([10], 10), [])).toEqual([]);
+  });
+});
+
+/* ==================== 快速滑动 / 首尾项 ==================== */
+/* 指针事件是稀疏的，一次 pointermove 可能跨过好几项；只写"指针正下方那一项"
+   会把中间整段漏掉（真机上表现为"快速划一下只选中了头尾"）。这一组把
+   "补齐"与"夹到端点"钉死在纯计算层，DOM 层只管把下标喂进来。 */
+
+describe("clampIndex 下标夹取", () => {
+  it("越界时夹到首项 / 末项，不报错也不返回 -1", () => {
+    expect(clampIndex(-5, 4)).toBe(0);
+    expect(clampIndex(99, 4)).toBe(3);
+  });
+
+  it("范围内的下标原样返回", () => {
+    expect(clampIndex(0, 4)).toBe(0);
+    expect(clampIndex(2, 4)).toBe(2);
+  });
+
+  /** 空列表没有可夹的项 —— 返回 -1，调用方据此跳过，而不是当第 0 项写进去。 */
+  it("空列表返回 -1", () => {
+    expect(clampIndex(0, 0)).toBe(-1);
+    expect(clampIndex(-1, 0)).toBe(-1);
+  });
+});
+
+describe("applyDragRange 补齐被跳过的项", () => {
+  it("从第 1 项跳到第 4 项：中间的项全部补上", () => {
+    const st = beginDragSelection([], 10);
+    expect(applyDragRange(st, ORDER, 0, 3)).toBe(true);
+    expect(finishDragSelection(st, ORDER)).toEqual([10, 11, 12, 13]);
+  });
+
+  /**
+   * 兜底：先断言"旧路径做不到"，再断言"新路径做得到"。
+   * 旧路径 = 只 applyDragTo 指针正下方那一项。
+   */
+  it("旧路径（只写命中那一项）会漏掉中间项 —— 新路径不会", () => {
+    const old = beginDragSelection([], 10);
+    applyDragTo(old, ORDER[3]); // 指针直接落在第 4 项
+    expect(finishDragSelection(old, ORDER)).toEqual([10, 13]); // ← 漏了 11、12
+
+    const now = beginDragSelection([], 10);
+    applyDragRange(now, ORDER, 0, 3);
+    expect(finishDragSelection(now, ORDER)).toEqual([10, 11, 12, 13]);
+  });
+
+  it("反向（从后往前抹）同样补齐", () => {
+    const st = beginDragSelection(ORDER, ORDER[4]); // 起点已选中 → 整段取消
+    expect(applyDragRange(st, ORDER, 4, 1)).toBe(true);
+    // 只抹到下标 1；下标 5 那一项（15）在范围外，保持不动
+    expect(finishDragSelection(st, ORDER)).toEqual([10, 15]);
+  });
+
+  it("反向一路抹到首项 → 只剩下范围外的尾项", () => {
+    const st = beginDragSelection(ORDER, ORDER[5]); // 从最后一项起手
+    applyDragRange(st, ORDER, 5, 0);
+    expect(finishDragSelection(st, ORDER)).toEqual([]);
+  });
+
+  /** 首尾项：下标越界要被夹住，端点不能漏也不能报错。 */
+  it("下标越界时夹到端点，端点项不漏", () => {
+    const st = beginDragSelection([], 10);
+    expect(applyDragRange(st, ORDER, -99, 99)).toBe(true);
+    expect(finishDragSelection(st, ORDER)).toEqual([10, 11, 12, 13, 14, 15]);
+  });
+
+  it("起止相同 = 只写那一项（幂等由 applyDragTo 保证）", () => {
+    const st = beginDragSelection([], 11);
+    expect(applyDragRange(st, ORDER, 1, 1)).toBe(false); // 起点那一项已经写过了
+    expect(finishDragSelection(st, ORDER)).toEqual([11]);
+  });
+
+  it("重复划同一段不会来回翻转（幂等）", () => {
+    const st = beginDragSelection([], 10);
+    expect(applyDragRange(st, ORDER, 0, 3)).toBe(true);
+    expect(applyDragRange(st, ORDER, 0, 3)).toBe(false);
+    expect(finishDragSelection(st, ORDER)).toEqual([10, 11, 12, 13]);
+  });
+
+  it("拖动结束后不再生效", () => {
+    const st = beginDragSelection([], 10);
+    const ended = { ...st, active: false };
+    expect(applyDragRange(ended, ORDER, 0, 3)).toBe(false);
+    expect(finishDragSelection(ended, ORDER)).toEqual([10]);
+  });
+
+  it("空列表不会写出任何东西", () => {
+    const st = beginDragSelection([], 10);
+    expect(applyDragRange(st, [], 0, 3)).toBe(false);
+  });
+
+  /* ---------- 下面几条是复核补的：覆盖「只有 1 项 / 只有 0 项 / 重叠 range /
+     order 里有重复 id / 反向且两端同时越界」这些他没写到的组合 ---------- */
+
+  /** 只有 1 项的列表：下标再怎么越界都只能落到那一项上。 */
+  it("列表只有 1 项时，越界下标全部夹到它身上", () => {
+    const st = beginDragSelection([], 7);
+    expect(applyDragRange(st, [7], -99, 99)).toBe(false); // 起手那项已写过 → 无变化
+    expect(finishDragSelection(st, [7])).toEqual([7]);
+
+    const st2 = beginDragSelection([7], 7); // 起点已选中 → 方向是取消
+    expect(applyDragRange(st2, [7], 5, -5)).toBe(false);
+    expect(finishDragSelection(st2, [7])).toEqual([]);
+  });
+
+  /** 连续两次 range 有重叠：重叠段不能被"第二次经过"翻转掉。 */
+  it("两次 range 有重叠时重叠段不翻转", () => {
+    const st = beginDragSelection([], 10);
+    expect(applyDragRange(st, ORDER, 0, 2)).toBe(true); // 10 11 12
+    expect(applyDragRange(st, ORDER, 1, 4)).toBe(true); // 再补 13 14，重叠的 11 12 不动
+    expect(finishDragSelection(st, ORDER)).toEqual([10, 11, 12, 13, 14]);
+
+    // 反向再抹一次 1..3：起点（下标 0）在起手那一下就已经被取消了，
+    // 之后只有下标 1~3 被抹掉，下标 4（14）在范围外保持不动
+    const st2 = beginDragSelection([10, 11, 12, 13, 14], 10);
+    expect(applyDragRange(st2, ORDER, 3, 1)).toBe(true);
+    expect(finishDragSelection(st2, ORDER)).toEqual([14]);
+  });
+
+  /** `order` 里出现重复 id（渲染层理论上不该，但状态机不能崩、不能重复输出）。 */
+  it("order 里有重复 id 时不崩、结果不重复、不翻转", () => {
+    const dup = [10, 11, 10];
+    const st = beginDragSelection([], 10);
+    expect(applyDragRange(st, dup, 0, 2)).toBe(true); // 只新增了 11
+    expect(finishDragSelection(st, dup)).toEqual([10, 11]);
+
+    // 反方向：从已选中的 10 起手 → 整段都是取消，重复出现的 10 也只会被删一次
+    const st2 = beginDragSelection([10, 11], 10); // 方向 = 取消
+    expect(applyDragRange(st2, dup, 0, 2)).toBe(true);
+    expect(finishDragSelection(st2, dup)).toEqual([]);
+  });
+
+  /** 反向 + 两端同时越界：要夹成「全表反向」，不是空转也不是死循环。 */
+  it("反向且两端同时越界 → 夹成整段反向，不死循环", () => {
+    const st = beginDragSelection(ORDER, ORDER[5]); // 从末项起手，方向 = 取消
+    expect(applyDragRange(st, ORDER, 99, -99)).toBe(true);
+    expect(finishDragSelection(st, ORDER)).toEqual([]);
+  });
+
+  /** 单项列表 + 空列表的 `clampIndex` 边界（长度 1 时上下界重合）。 */
+  it("clampIndex：长度为 1 时任意下标都返回 0", () => {
+    expect(clampIndex(-1, 1)).toBe(0);
+    expect(clampIndex(0, 1)).toBe(0);
+    expect(clampIndex(99, 1)).toBe(0);
   });
 });
 

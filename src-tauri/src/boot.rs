@@ -120,36 +120,45 @@ pub fn prepare(identifier: &str) -> String {
     line
 }
 
+/// 每次启动都清的缓存：**坏了会让 GPU 子进程起不来**（页面就此白屏）的那几个。
+///
+/// 共同点是体积小、重建快，删掉的代价可以忽略。
+const CLEAN_AT_ROOT: [&str; 3] = ["GPUPersistentCache", "GrShaderCache", "ShaderCache"];
+const CLEAN_AT_DEFAULT: [&str; 3] = ["GPUCache", "DawnGraphiteCache", "DawnWebGPUCache"];
+
 /// 常规清理：删掉会损坏但可重建的缓存。
+///
+/// ⚠️ 刻意**不再每次删 `Default\Cache` 与 `Default\Code Cache`**：它们是 HTTP /
+/// JS 缓存，与「GPU 子进程不可用」那类白屏无关，却是清理体积的大头（实测
+/// 10MB+，比其余几项加起来还大）。每次无条件删掉，等于每启动一次都要让
+/// WebView2 重新拉一遍资源——首屏反而更慢，而起因是我们要防的故障之外的东西。
+/// 真到了「上一次没起来」的彻底重置分支，整个 `EBWebView` 会被整体挪走，
+/// 这两项目自然一并清掉，不需要在这里重复。
 fn clean_volatile_caches(root: &Path) -> Vec<String> {
+    let started = Instant::now();
     let dir = webview_dir(root);
     let mut report = Vec::new();
     if !dir.exists() {
         return report;
     }
-    // 这些目录的共同点：坏了会让 GPU 子进程起不来（页面就此白屏），
-    // 删掉后 WebView2 会自己重建，代价只是首次绘制慢一点。
-    for name in ["GPUPersistentCache", "GrShaderCache", "ShaderCache"] {
+    for name in CLEAN_AT_ROOT {
         remove_dir_quiet(&dir.join(name), &mut report);
     }
-    for name in [
-        "GPUCache",
-        "Code Cache",
-        "Cache",
-        "DawnGraphiteCache",
-        "DawnWebGPUCache",
-    ] {
+    for name in CLEAN_AT_DEFAULT {
         remove_dir_quiet(&dir.join("Default").join(name), &mut report);
     }
     report.extend(clean_stale_backups(root));
+    report.push(format!("清理耗时 {} ms", started.elapsed().as_millis()));
     report
 }
 
 /// 彻底重置：把 `EBWebView` 改名挪走再删。
 fn reset_webview_dir(root: &Path) -> Vec<String> {
+    let started = Instant::now();
     let mut report = Vec::new();
     move_away_then_delete(&webview_dir(root), &mut report);
     report.extend(clean_stale_backups(root));
+    report.push(format!("重置耗时 {} ms", started.elapsed().as_millis()));
     report
 }
 

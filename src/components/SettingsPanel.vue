@@ -4,14 +4,22 @@
  * 仅做了布局/排版美化（分组卡片 + 统一变量），交互逻辑不变。
  */
 import { onMounted, ref } from "vue";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { askConfirm } from "../utils/confirm";
 import {
-  dbInfo, detectPlayer, doubanTest, llmParseName, llmPresets, omdbLookup, openDataDir,
-  readReadyMarker, runtimeInfo, searchDouban, tmdbTest, type LlmPreset,
+  backupDatabase, clearMetadataCache, dbInfo, detectPlayer, doubanTest, exportNfo,
+  importNfo, libraryHealth, listProviders, llmParseName, llmPresets, omdbLookup,
+  openDataDir, purgeExpiredCache, readReadyMarker, runtimeInfo, searchDouban,
+  tmdbTest,
+  type LibraryHealth, type LlmPreset, type ProviderEntry,
 } from "../api/commands";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useMediaStore } from "../stores/mediaStore";
 import { useCategoryStore } from "../stores/categoryStore";
+import {
+  comboFromEvent, formatCombo, normalizeCombo,
+  SHORTCUT_ACTIONS, SHORTCUT_LABELS, type ShortcutAction,
+} from "../utils/shortcuts";
 
 const store = useSettingsStore();
 const media = useMediaStore();
@@ -274,6 +282,204 @@ async function onOpenDataDir(): Promise<void> {
     status.value = "❌ " + String(e);
   }
 }
+
+/* ---------------- 数据互通与备份（v6） ---------------- */
+/* 这一整块对外只写两种东西：`.nfo` 旁车文件、一份数据库副本。
+   视频文件从头到尾是只读的 —— 不转码、不重编码、不裁剪、不覆盖。 */
+
+const health = ref<LibraryHealth | null>(null);
+const providers = ref<ProviderEntry[]>([]);
+const shareBusy = ref(false);
+const shareMsg = ref("");
+/** 是否覆盖已存在的 NFO：默认**关**，避免冲掉用户或 Kodi / tMM 写的文件。 */
+const nfoOverwrite = ref(false);
+
+onMounted(async () => {
+  try {
+    health.value = await libraryHealth();
+  } catch {
+    health.value = null;
+  }
+  try {
+    providers.value = (await listProviders()).items;
+  } catch {
+    providers.value = [];
+  }
+});
+
+/**
+ * 导出 NFO。
+ *
+ * `targetDir` 为空表示写在视频文件旁边（Kodi / tMM 的 sidecar 约定）——
+ * 那是**新建**一个 `.nfo`，视频文件本身一个字节都不动。
+ */
+async function runExport(targetDir: string | null): Promise<void> {
+  if (shareBusy.value) return;
+  shareMsg.value = "";
+  if (
+    nfoOverwrite.value &&
+    !(await askConfirm("已勾选「覆盖已有 NFO」：同名的旧 NFO 会被重写。确定继续？", "导出 NFO"))
+  ) {
+    return;
+  }
+  shareBusy.value = true;
+  try {
+    // 不传 ids 由后端决定范围：这里导出全部条目
+    const r = await exportNfo({ targetDir, overwrite: nfoOverwrite.value });
+    shareMsg.value =
+      `✅ ${r.message}（写出 ${r.written} · 跳过 ${r.skipped} · 失败 ${r.failed}）`;
+  } catch (e) {
+    shareMsg.value = "❌ " + String(e);
+  } finally {
+    shareBusy.value = false;
+  }
+}
+
+/** 导出到视频文件旁（sidecar）。 */
+async function onExportSidecar(): Promise<void> {
+  await runExport(null);
+}
+
+/** 导出到用户指定的目录（不想在媒体目录里留文件时用）。 */
+async function onExportToDir(): Promise<void> {
+  const picked = await open({ directory: true, multiple: false, title: "选择 NFO 输出目录" });
+  const dir = Array.isArray(picked) ? picked[0] : picked;
+  if (!dir) return;
+  await runExport(String(dir));
+}
+
+/** 从一个目录导入 NFO：只回填空字段，已有值一律不覆盖。 */
+async function onImportNfo(): Promise<void> {
+  if (shareBusy.value) return;
+  const picked = await open({ directory: true, multiple: false, title: "选择包含 NFO 的目录" });
+  const dir = Array.isArray(picked) ? picked[0] : picked;
+  if (!dir) return;
+  shareMsg.value = "";
+  shareBusy.value = true;
+  try {
+    const r = await importNfo(String(dir));
+    shareMsg.value =
+      `✅ ${r.message}（读到 ${r.scanned} · 回填 ${r.filled} · 改判 ${r.reclassified} · 未匹配 ${r.unmatched}）`;
+    await media.load();
+  } catch (e) {
+    shareMsg.value = "❌ " + String(e);
+  } finally {
+    shareBusy.value = false;
+  }
+}
+
+/**
+ * 备份数据库。
+ *
+ * 走 `VACUUM INTO`：得到一份一致的快照，不锁库、不改原库；
+ * 目标文件**已存在时后端直接拒绝**，绝不覆盖用户已有的备份。
+ */
+async function onBackup(): Promise<void> {
+  if (shareBusy.value) return;
+  const dest = await save({
+    title: "把数据库备份到…",
+    defaultPath: "media-manager-backup.db",
+    filters: [{ name: "SQLite 数据库", extensions: ["db"] }],
+  });
+  if (!dest) return;
+  shareMsg.value = "";
+  shareBusy.value = true;
+  try {
+    const p = await backupDatabase(dest);
+    shareMsg.value = `✅ 已备份到：${p}`;
+  } catch (e) {
+    shareMsg.value = "❌ " + String(e);
+  } finally {
+    shareBusy.value = false;
+  }
+}
+
+/** 清空元数据缓存（刮削结果）；留空 provider 表示全部清。 */
+async function onClearCache(): Promise<void> {
+  if (shareBusy.value) return;
+  shareMsg.value = "";
+  shareBusy.value = true;
+  try {
+    const n = await clearMetadataCache(null);
+    shareMsg.value = `✅ 已清除 ${n} 条元数据缓存（下次刮削会重新联网取）`;
+  } catch (e) {
+    shareMsg.value = "❌ " + String(e);
+  } finally {
+    shareBusy.value = false;
+  }
+}
+
+/** 只清过期的缓存（7 天 TTL），没过期的留着继续用。 */
+async function onPurgeCache(): Promise<void> {
+  if (shareBusy.value) return;
+  shareMsg.value = "";
+  shareBusy.value = true;
+  try {
+    const n = await purgeExpiredCache();
+    shareMsg.value = `✅ 已清理 ${n} 条过期缓存`;
+  } catch (e) {
+    shareMsg.value = "❌ " + String(e);
+  } finally {
+    shareBusy.value = false;
+  }
+}
+
+/* ---------------- 快捷键（可自定义） ---------------- */
+
+const shortcutActions = SHORTCUT_ACTIONS.map((key) => ({ key, label: SHORTCUT_LABELS[key] }));
+
+function rawShortcut(a: ShortcutAction): string {
+  switch (a) {
+    case "selectAll":
+      return store.shortcutSelectAll;
+    case "invert":
+      return store.shortcutInvert;
+    case "confirm":
+      return store.shortcutConfirm;
+    case "clear":
+      return store.shortcutClear;
+  }
+}
+
+function setShortcut(a: ShortcutAction, v: string): void {
+  switch (a) {
+    case "selectAll":
+      store.shortcutSelectAll = v;
+      break;
+    case "invert":
+      store.shortcutInvert = v;
+      break;
+    case "confirm":
+      store.shortcutConfirm = v;
+      break;
+    case "clear":
+      store.shortcutClear = v;
+      break;
+  }
+}
+
+/** 输入框里显示成人类可读的形式；未绑定就留空，让 placeholder 提示用户按键。 */
+function shortcutValue(a: ShortcutAction): string {
+  const raw = rawShortcut(a).trim();
+  return raw ? formatCombo(raw) : "";
+}
+
+/**
+ * 焦点在输入框里时**直接按组合键**即录入。
+ *
+ * 解析不出来（比如只按了一个 Shift）就原样不动——否则用户想按 `Ctrl+Shift+A`，
+ * 按下 Ctrl 的那一刻就被记成 `Ctrl` 了。
+ */
+function onShortcutKey(a: ShortcutAction, e: KeyboardEvent): void {
+  const combo = comboFromEvent(e);
+  const norm = combo ? normalizeCombo(combo) : null;
+  if (!norm) return;
+  setShortcut(a, formatCombo(norm));
+}
+
+function clearShortcut(a: ShortcutAction): void {
+  setShortcut(a, "");
+}
 </script>
 
 <template>
@@ -445,6 +651,112 @@ async function onOpenDataDir(): Promise<void> {
     </div>
 
     <div class="panel">
+      <h3 class="panel-title">
+        数据源开关
+        <span class="badge">关掉不等于删 Key</span>
+      </h3>
+      <p class="panel-hint split">
+        这里回答的是「<strong>哪些源参与刮削</strong>」。
+        关掉一个源<strong>不会</strong>把它上面填的 Key 删掉，也不会让后面的源顶上来——
+        顺序是写死的：<strong>TMDb 权威 → TheTVDB → Fanart.tv → OMDb → 豆瓣兜底</strong>。
+        关掉 TMDb 时豆瓣会承担整条刮削，而不是直接失败。
+      </p>
+      <div class="providers">
+        <label v-for="p in providers" :key="p.id" class="prov-row">
+          <input
+            type="checkbox"
+            :checked="store.isProviderOn(p.id)"
+            @change="store.toggleProvider(p.id)"
+          />
+          <span class="prov-name">{{ p.label }}</span>
+          <span class="prov-desc">{{ p.provides }}</span>
+        </label>
+        <p v-if="!providers.length" class="panel-hint">读不到数据源列表（不影响使用）</p>
+      </div>
+      <p class="panel-hint">改完记得点最下方的「保存」。</p>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">
+        匹配筛选
+        <span class="badge">手动匹配 TMDB 时生效</span>
+      </h3>
+      <p class="panel-hint split">
+        这些条件决定「候选怎么排、哪些直接剔除」，用来压低误匹配：
+        优先级是<strong>片名完全一致 → 原标题 / 别名一致 → 包含 → 模糊</strong>，
+        年份作为修正项叠加。
+      </p>
+      <div class="field">
+        <label class="switch">
+          <input v-model="store.matchFuzzy" type="checkbox" />
+          <span>模糊匹配（关掉就只剩完全一致与包含）</span>
+        </label>
+      </div>
+      <div class="field">
+        <label>年份容差</label>
+        <select v-model.number="store.matchYearTolerance" class="select">
+          <option :value="0">必须同一年</option>
+          <option :value="1">前后 1 年也算命中</option>
+          <option :value="2">前后 2 年也算命中</option>
+          <option :value="10">不看年份</option>
+        </select>
+        <p class="panel-hint">年份差超出容差的候选会被扣分，排到后面去。</p>
+      </div>
+      <div class="field">
+        <label>候选上限（TMDB 每页 20 条）</label>
+        <select v-model.number="store.matchLimit" class="select">
+          <option :value="20">20（只第一页）</option>
+          <option :value="60">60（推荐）</option>
+          <option :value="120">120</option>
+          <option :value="200">200（上限）</option>
+        </select>
+        <p class="panel-hint">调大能看见更多候选，但检索也会慢一点。</p>
+      </div>
+      <div class="field">
+        <label>排除关键词（黑名单）</label>
+        <textarea
+          v-model="store.matchBlacklist"
+          rows="2"
+          placeholder="剧场版, 演唱会, OVA, 幕后花絮"
+        ></textarea>
+        <p class="panel-hint">
+          逗号或换行分隔。候选标题里出现任一个就<strong>整条剔除</strong>，
+          连候选列表都不进。
+        </p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">
+        快捷键
+        <span class="badge">可自定义</span>
+      </h3>
+      <p class="panel-hint split">
+        只对「选择模式」与 TMDB 候选面板生效，输入框里不抢键。
+        点一下输入框再<strong>直接按你想用的组合键</strong>即可录入；留空 = 不绑定。
+      </p>
+      <div
+        v-for="a in shortcutActions"
+        :key="a.key"
+        class="field"
+      >
+        <label>{{ a.label }}</label>
+        <div class="add">
+          <input
+            :value="shortcutValue(a.key)"
+            readonly
+            :placeholder="`按下组合键…`"
+            @keydown.prevent="onShortcutKey(a.key, $event)"
+          />
+          <button class="mini" @click="clearShortcut(a.key)">清除</button>
+        </div>
+      </div>
+      <p class="panel-hint">
+        写法示例：<code>Ctrl+A</code>、<code>Ctrl+Shift+A</code>、<code>Ctrl+Enter</code>、<code>Esc</code>。
+      </p>
+    </div>
+
+    <div class="panel">
       <h3 class="panel-title">分类维护</h3>
       <p class="panel-hint split">
         左侧栏目的分类全部存在数据库里，手动建的在设置页之外（左侧导航「＋」）操作。
@@ -565,6 +877,60 @@ async function onOpenDataDir(): Promise<void> {
     </div>
 
     <div class="panel">
+      <h3 class="panel-title">
+        数据互通与备份
+        <span class="badge">非侵入式 · 不碰视频文件</span>
+      </h3>
+      <p class="panel-hint split">
+        NFO 是 Kodi / tinyMediaManager 通用的<strong>旁车元数据</strong>文件
+        （<code>xxx.mkv</code> 旁边一个 <code>xxx.nfo</code>）。
+        导出只会<strong>新建</strong>这个文件，视频本身一个字节都不会动；
+        默认是<strong>不覆盖</strong>，已经存在的 NFO 直接跳过。
+        导入则只回填<strong>空字段</strong>，你已有的标题与海报不会被顶掉。
+      </p>
+      <div class="field">
+        <label class="switch">
+          <input v-model="nfoOverwrite" type="checkbox" />
+          <span>覆盖已存在的 NFO（默认关闭）</span>
+        </label>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-ghost" :disabled="shareBusy" @click="onExportSidecar">
+          {{ shareBusy ? "导出中…" : "导出到视频文件旁" }}
+        </button>
+        <button class="btn btn-ghost" :disabled="shareBusy" @click="onExportToDir">
+          导出到指定目录…
+        </button>
+        <button class="btn btn-ghost" :disabled="shareBusy" @click="onImportNfo">
+          从目录导入 NFO…
+        </button>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-ghost" :disabled="shareBusy" @click="onBackup">
+          备份数据库到…
+        </button>
+        <button class="btn btn-ghost" :disabled="shareBusy" @click="onPurgeCache">
+          清理过期缓存
+        </button>
+        <button class="btn btn-danger" :disabled="shareBusy" @click="onClearCache">
+          清空元数据缓存
+        </button>
+      </div>
+      <p class="panel-hint split">
+        备份走 SQLite 的 <code>VACUUM INTO</code>，得到一份一致快照，
+        <strong>不锁库、不改原库</strong>；目标文件已存在时后端<strong>直接拒绝</strong>，
+        不会覆盖你之前的备份。缓存只存元数据 API 的响应（7 天过期），清掉后下次刮削重新联网取。
+      </p>
+      <p v-if="shareMsg" class="panel-hint">{{ shareMsg }}</p>
+      <div class="diag" v-if="providers.length">
+        <p class="panel-hint">
+          数据源顺序（越靠前越权威）：
+          {{ providers.map((p) => p.label).join(" → ") }}
+        </p>
+      </div>
+    </div>
+
+    <div class="panel">
       <h3 class="panel-title">维护与诊断</h3>
       <div class="toolbar">
         <button class="btn btn-ghost" @click="onOpenDataDir">打开数据目录</button>
@@ -580,6 +946,12 @@ async function onOpenDataDir(): Promise<void> {
         </p>
         <p v-if="dbPath" class="panel-hint">
           数据库：{{ dbPath }}<span v-if="schemaVersion !== null">（结构版本 v{{ schemaVersion }}）</span>
+        </p>
+        <p v-if="health" class="panel-hint">
+          检索索引：{{ health.ftsEnabled ? "FTS5 已启用" : "未启用（回落到 LIKE 检索）" }}
+          · 元数据缓存 {{ health.cacheRows }} 条
+          · 观看记录 {{ health.playbackRows }} 条
+          · ffprobe {{ health.ffprobeAvailable ? "可用" : "不可用（跳过技术信息探测）" }}
         </p>
       </div>
     </div>
@@ -650,4 +1022,15 @@ code {
 .hist tbody tr:last-child td { border-bottom: 0; }
 
 .diag { display: flex; flex-direction: column; gap: 4px; margin-top: calc(var(--space) * 3); }
+
+/* 数据源开关：一行一个源，勾选框在最左，说明文字在右 */
+.providers { display: flex; flex-direction: column; gap: calc(var(--space) * 2); }
+.prov-row {
+  display: flex; align-items: baseline; gap: 10px; padding: 8px 12px;
+  border-radius: var(--radius-s); background: var(--surface-2); border: 1px solid var(--border);
+  cursor: pointer;
+}
+.prov-row input { width: 15px; height: 15px; accent-color: var(--accent); flex: none; }
+.prov-name { flex: none; min-width: 84px; font-size: var(--fs-13); color: var(--text); font-weight: 550; }
+.prov-desc { font-size: var(--fs-12); color: var(--muted); }
 </style>

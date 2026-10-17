@@ -1,6 +1,7 @@
 //! 外部播放器桥接：优先 PotPlayer，支持自动探测常见安装路径。
 
 use crate::commands::settings::load_potplayer_path;
+use crate::util::no_console;
 use rusqlite::Connection;
 use std::path::Path;
 use std::process::Command;
@@ -65,9 +66,10 @@ pub fn play_media(state: State<'_, Mutex<Connection>>, path: String) -> Result<S
             Ok(player)
         }
         None => {
-            // 交给系统默认播放器（ShellExecute 语义）
-            Command::new("cmd")
-                .args(["/C", "start", "", path.as_str()])
+            // 交给系统默认播放器（ShellExecute 语义）。
+            // 套 `no_console`：`cmd.exe` 是控制台程序，不带 CREATE_NO_WINDOW 时
+            // Windows 会给它新开一个控制台——GUI 主进程点「播放」就会闪一下黑框。
+            no_console(Command::new("cmd").args(["/C", "start", "", path.as_str()]))
                 .spawn()
                 .map_err(|e| format!("未找到 PotPlayer，且调用系统默认播放器失败：{e}"))?;
             Ok("system".to_string())

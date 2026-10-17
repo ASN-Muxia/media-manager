@@ -12,7 +12,7 @@
  * 逐字节对齐：重复中不讲运气。
  *
  * 用法：
- *   node scripts/verify-delta.mjs ^
+ *   node mjs/build/verify-delta.mjs ^
  *     --base release/上一版.zip ^
  *     --delta release/新版-delta.zip ^
  *     --expect-list release/新版.zip.filelist.txt ^
@@ -38,7 +38,7 @@ function parseArgs(argv) {
   const missing = Object.entries(out).filter(([, v]) => !v).map(([k]) => `--${k}`);
   if (missing.length) {
     console.error(`缺少参数: ${missing.join(", ")}`);
-    console.error("用法: node scripts/verify-delta.mjs --base <旧版.zip> --delta <增量.zip> --expect-list <新版.filelist.txt> --expect-root <目标目录>");
+    console.error("用法: node mjs/build/verify-delta.mjs --base <旧版.zip> --delta <增量.zip> --expect-list <新版.filelist.txt> --expect-root <目标目录>");
     process.exit(2);
   }
   return out;

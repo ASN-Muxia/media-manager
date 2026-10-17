@@ -19,13 +19,18 @@ rem ==========================================================================
 set "MM_ROOT=%~dp0"
 if "%MM_ROOT:~-1%"=="\" set "MM_ROOT=%MM_ROOT:~0,-1%"
 
-set "MM_PROFILE=debug"
+set "MM_PROFILE=release"
 set "MM_DO_BUILD=1"
 if /i "%~1"=="--release" set "MM_PROFILE=release"
+if /i "%~1"=="--debug" set "MM_PROFILE=debug"
 if /i "%~1"=="--no-build" set "MM_DO_BUILD=0"
+set "MM_FORCE_FLAG="
+if /i "%~1"=="--force" set "MM_FORCE_FLAG=--force"
+if /i "%~2"=="--force" set "MM_FORCE_FLAG=--force"
+rem 脚本会自动判断前端 / Rust 是否已最新，已最新则跳过构建（--force 强制重新构建）
 
 rem ---- 默认路径（可用环境变量覆盖）----
-if not defined MM_NODE set "MM_NODE=C:\Users\31506\.workbuddy\binaries\node\versions\22.22.2-3\node.exe"
+if not defined MM_NODE set "MM_NODE=C:\Users\31506\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
 if not exist "%MM_NODE%" if exist "C:\Users\31506\node\node-v22.23.3-win-x64\node.exe" set "MM_NODE=C:\Users\31506\node\node-v22.23.3-win-x64\node.exe"
 if not defined MM_CARGO set "MM_CARGO=C:\Users\31506\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
 if not defined MM_RUSTC set "MM_RUSTC=C:\Users\31506\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe"
@@ -83,21 +88,43 @@ exit /b 0
 
 rem ------------------------------------------------------------------ 子过程
 :do_build
-echo [1/3] 构建前端 ...
 pushd "%MM_ROOT%"
+call :need_frontend
+if errorlevel 1 goto :fe_skip
+echo [1/3] 构建前端 ...
 call "%MM_NODE%" node_modules\vite\bin\vite.js build
 set "MM_RC=%ERRORLEVEL%"
 popd
 if not "%MM_RC%"=="0" goto :err_frontend
+goto :rust_step
 
+:fe_skip
+echo [1/3] 构建前端 ... 已是最新，跳过
+popd
+
+:rust_step
 echo.
-echo [2/3] 编译 Rust（首次编译需要几分钟，请耐心等待）...
+echo [2/3] 构建 Rust（首次构建需要几分钟，请耐心等待）...
+call :need_rust
+if errorlevel 1 goto :rs_skip
 if "%MM_PROFILE%"=="release" call "%MM_CARGO%" build --release --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
 if "%MM_PROFILE%"=="debug" call "%MM_CARGO%" build --features custom-protocol --manifest-path "%MM_ROOT%\src-tauri\Cargo.toml"
 if errorlevel 1 goto :err_rust
 exit /b 0
 
-rem ------------------------------------------------------------------ 出错处理
+:rs_skip
+echo       Rust 已是最新，跳过
+exit /b 0
+
+rem ---- 构建判定：退出码 0=需要构建，1=可以跳过 ----
+:need_frontend
+call "%MM_NODE%" "%MM_ROOT%\mjs\dev\need-build.mjs" --frontend %MM_FORCE_FLAG%
+exit /b %ERRORLEVEL%
+
+:need_rust
+call "%MM_NODE%" "%MM_ROOT%\mjs\dev\need-build.mjs" --rust --profile %MM_PROFILE% %MM_FORCE_FLAG%
+exit /b %ERRORLEVEL%
+
 :err_node
 echo [错误] 找不到 Node.js。
 echo        请安装 Node.js，或设置环境变量 MM_NODE 指向 node.exe。

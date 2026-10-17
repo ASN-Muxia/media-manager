@@ -15,14 +15,14 @@
  *    变化过的文件，把「版本升级」的网络成本从整包的几百 KB 压到几 KB。
  *
  * 用法：
- *   node scripts/package.mjs                 # release/media-manager-src-<ver>-<短hash>.zip
- *   node scripts/package.mjs --format gz     # .tar.gz
- *   node scripts/package.mjs --no-git        # 不用 git，按排除规则遍历
- *   node scripts/package.mjs --dry           # 只统计，不落盘
- *   node scripts/package.mjs --root <dir>    # 打包别的目录（用于同口径对比历史版本）
- *   node scripts/package.mjs --tag <name>    # 自定义输出文件名前缀，对比时用
- *   node scripts/package.mjs --reproducible  # 归一化时间戳：同一份内容必然产出同一份字节
- *   node scripts/package.mjs --delta-from release/xxx.zip.filelist.txt
+ *   node mjs/build/package.mjs                 # release/media-manager-src-<ver>-<短hash>.zip
+ *   node mjs/build/package.mjs --format gz     # .tar.gz
+ *   node mjs/build/package.mjs --no-git        # 不用 git，按排除规则遍历
+ *   node mjs/build/package.mjs --dry           # 只统计，不落盘
+ *   node mjs/build/package.mjs --root <dir>    # 打包别的目录（用于同口径对比历史版本）
+ *   node mjs/build/package.mjs --tag <name>    # 自定义输出文件名前缀，对比时用
+ *   node mjs/build/package.mjs --reproducible  # 归一化时间戳：同一份内容必然产出同一份字节
+ *   node mjs/build/package.mjs --delta-from release/xxx.zip.filelist.txt
  *                                            # 增量包：只含新增 / 修改过的文件
  *
  * 增量包怎么工作：`*.filelist.txt` 每行是 `<sha256> <体积> <路径>`。拿它跟当前目录比对，
@@ -38,7 +38,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 
-const DEFAULT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// 本文件在 <项目根>/mjs/build/ 下，要上溯两级才是项目根（原来放在 scripts/ 时只需一级）。
+export const DEFAULT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 /** 打包根目录。默认指向项目根，可用 `--root` 换（同口径对比历史版本时用）。 */
 let ROOT = DEFAULT_ROOT;

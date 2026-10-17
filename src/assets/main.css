@@ -28,6 +28,10 @@
   /* 间距基准 */
   --space: 4px;
 
+  /* 海报网格的最小列宽：网格用它算列数，卡片本身不再写死像素宽，
+     窗口缩放时列数自适应，海报靠 aspect-ratio 保持 2:3。 */
+  --card-min: 150px;
+
   /* 字体 */
   --font: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "PingFang SC",
     "Noto Sans CJK SC", "Helvetica Neue", Arial, sans-serif;

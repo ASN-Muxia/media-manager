@@ -41,7 +41,7 @@ if /i "%~1"=="nogit" set "MM_ARGS=--no-git"
 rem Node 输出的是 UTF-8，临时切到 65001 才能显示正常中文；
 rem 跑完立刻切回 936，否则本文件剩下的 GBK 中文又会显示成一团。
 chcp 65001 >nul 2>&1
-call "%MM_NODE%" "%MM_ROOT%\scripts\package.mjs" %MM_ARGS%
+call "%MM_NODE%" "%MM_ROOT%\mjs\build\package.mjs" %MM_ARGS%
 set "MM_RC=%ERRORLEVEL%"
 chcp 936 >nul 2>&1
 if not "%MM_RC%"=="0" goto :fail

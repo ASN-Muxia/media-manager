@@ -33,8 +33,68 @@ fn touch(dir: &Path, rel: &str) {
 fn memory_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-    conn.execute_batch(db::SCHEMA).unwrap();
+    // ⚠️ 必须走 `db::migrate` 而不是只建 `SCHEMA`：层级用的 `parent_id` /
+    // `sort_order` 是 v5 迁移补上去的列，只建初始表会得到「no such column」。
+    db::migrate(&conn).unwrap();
     conn
+}
+
+/// 什么都不做的增强器：让 `core` 的测试完全不依赖 provider / 网络。
+///
+/// 顺带证明一件事——`core` 现在只认 `NameEnhancer` 这个抽象，
+/// 换成真的大模型或换成空实现，扫描层都不用改。
+struct NoopEnhancer;
+
+impl NameEnhancer for NoopEnhancer {
+    fn needs(&self, _parsed: &ParsedName, _file_name: &str) -> bool {
+        false
+    }
+    fn enhance(&self, parsed: ParsedName, _n: &str) -> (ParsedName, Option<EnhancedFields>) {
+        (parsed, None)
+    }
+}
+
+/// 一个「会把标题改写掉」的假增强器：验证注入的结果确实落回 `ScanFile`。
+struct TitleFixer {
+    new_title: &'static str,
+}
+
+impl NameEnhancer for TitleFixer {
+    fn needs(&self, _parsed: &ParsedName, _file_name: &str) -> bool {
+        true
+    }
+    fn enhance(&self, mut parsed: ParsedName, _n: &str) -> (ParsedName, Option<EnhancedFields>) {
+        parsed.title = self.new_title.to_string();
+        (
+            parsed,
+            Some(EnhancedFields {
+                resolution: Some("1080p".to_string()),
+                release_source: Some("FakeGroup".to_string()),
+            }),
+        )
+    }
+}
+
+/// 注入式增强层：core 不再依赖 provider，但增强结果照样要落到 ScanFile 上。
+#[test]
+fn injected_enhancer_writes_fields_back() {
+    let mut files = vec![ScanFile {
+        path: PathBuf::from("/x/00123.mkv"),
+        name: "00123.mkv".to_string(),
+        size: 1,
+        parsed: parse_file_name("00123.mkv"),
+        kind: MediaKind::Unknown,
+        root_index: 0,
+        folder: None,
+        group_key: None,
+        resolution: None,
+        release_source: None,
+    }];
+    let improved = apply_llm_enhancement(&mut files, &TitleFixer { new_title: "卧虎藏龙" });
+    assert_eq!(improved, 1, "标题被改写应计入 improved");
+    assert_eq!(files[0].parsed.title, "卧虎藏龙");
+    assert_eq!(files[0].resolution.as_deref(), Some("1080p"));
+    assert_eq!(files[0].release_source.as_deref(), Some("FakeGroup"));
 }
 
 #[test]
@@ -264,7 +324,8 @@ fn llm_enhancement_is_noop_when_disabled() {
         release_source: None,
     }];
     let before = files[0].parsed.clone();
-    let improved = apply_llm_enhancement(&mut files, &crate::provider::llm::LlmConfig::default(), &[]);
+    // 用一个「什么都不做」的假增强器：core 的测试不依赖 provider，也不联网。
+    let improved = apply_llm_enhancement(&mut files, &NoopEnhancer);
     assert_eq!(improved, 0);
     assert_eq!(files[0].parsed.title, before.title, "未启用时不应改动解析结果");
     assert!(files[0].resolution.is_none());
@@ -581,6 +642,80 @@ fn unmarked_numbered_files_become_continuous_episodes() {
     std::fs::remove_dir_all(&d).ok();
 }
 
+/// 用户真实场景回归：一整个目录的「剧名 集号.mkv」（大明风华）入库后，
+/// 剧集行的标题必须是**剧名本身**，不能拖着集号——界面曾因此显示成
+/// 「大明风华01」。`group_key` 一直是干净的，漏网的是 `media.title`。
+#[test]
+fn numbered_series_title_does_not_carry_episode_number() {
+    let d = temp_dir("daming");
+    touch(&d, "大明风华/大明风华 01.mkv");
+    touch(&d, "大明风华/大明风华 02.mkv");
+    touch(&d, "大明风华/大明风华 03.mkv");
+    touch(&d, "大明风华/大明风华 04.mkv");
+    touch(&d, "大明风华/大明风华 05.mkv");
+
+    let mut conn = memory_db();
+    let roots = vec![d.to_string_lossy().to_string()];
+    let files = collect_files(&roots);
+    let stats = import(&mut conn, &files, &roots).expect("导入应成功");
+
+    let titles: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT title FROM media WHERE type='tv' ORDER BY title")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        titles,
+        vec!["大明风华".to_string()],
+        "剧集标题不能带集号：{titles:?}（stats={stats:?}）"
+    );
+    let eps = episodes_of(&conn);
+    assert_eq!(
+        eps,
+        vec![(1, 1), (1, 2), (1, 3), (1, 4), (1, 5)],
+        "集号仍是连续的 1..5：{eps:?}"
+    );
+
+    std::fs::remove_dir_all(&d).ok();
+}
+
+/// 同一场景的变体：点号分隔的「剧名.01.mkv」（解析器把点换成空格后
+/// 标题同样是「大明风华 01」）同样不能污染剧集标题。
+#[test]
+fn dotted_and_year_titles_keep_correct_series_name() {
+    let d = temp_dir("daming-dot");
+    touch(&d, "大明风华/大明风华.01.mkv");
+    touch(&d, "大明风华/大明风华.02.mkv");
+    touch(&d, "大明风华/大明风华.03.mkv");
+    touch(&d, "大明风华/大明风华.04.mkv");
+
+    let mut conn = memory_db();
+    let roots = vec![d.to_string_lossy().to_string()];
+    let files = collect_files(&roots);
+    let stats = import(&mut conn, &files, &roots).expect("导入应成功");
+
+    let titles: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT title FROM media WHERE type='tv' ORDER BY title")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        titles,
+        vec!["大明风华".to_string()],
+        "点号分隔的集号同样不能留在剧集标题里：{titles:?}（stats={stats:?}）"
+    );
+
+    std::fs::remove_dir_all(&d).ok();
+}
+
 /// C. 哆啦A梦：集数极多、文件名是纯数字或带季标记，必须聚成一条且集号连续。
 #[test]
 fn long_running_anime_with_pure_numbers_stays_one_series() {
@@ -666,7 +801,7 @@ fn import_reported_reports_progress() {
     let files = collect_files(&roots);
 
     let mut seen: Vec<(usize, String)> = Vec::new();
-    let stats = import_reported(&mut conn, &files, &roots, &mut |phase, n, name| {
+    let stats = import_reported(&mut conn, &files, &roots, None, &mut |phase, n, name| {
         assert_eq!(phase, PHASE_IMPORT);
         seen.push((n, name.to_string()));
         true
@@ -790,4 +925,295 @@ fn scan_history_stores_real_root_paths() {
     );
 
     std::fs::remove_dir_all(&d).ok();
+}
+
+/* ---------- 同目录同片：多文件归并成「一条条目 + 多个版本」 ---------- */
+
+/// 手工造一个待入库文件（绕过 `collect_files`，单测只关心入库与归并）。
+fn scan_file(path: &str, title: &str, kind: MediaKind, year: Option<i32>, size: u64) -> ScanFile {
+    let p = PathBuf::from(path);
+    let name = p.file_name().unwrap().to_string_lossy().to_string();
+    let mut parsed = parse_file_name(&name);
+    parsed.title = title.to_string();
+    parsed.year = year;
+    ScanFile {
+        path: p,
+        name,
+        size,
+        parsed,
+        kind,
+        root_index: 0,
+        folder: None,
+        group_key: None,
+        resolution: None,
+        release_source: None,
+    }
+}
+
+fn kotonoha() -> Vec<ScanFile> {
+    vec![
+        scan_file(
+            "D:/m/言叶之庭/言叶之庭.2013.BD1080p.mkv",
+            "言叶之庭",
+            MediaKind::Movie,
+            Some(2013),
+            100,
+        ),
+        scan_file(
+            "D:/m/言叶之庭/言叶之庭.2013.2160p.mkv",
+            "言叶之庭",
+            MediaKind::Movie,
+            Some(2013),
+            200,
+        ),
+    ]
+}
+
+#[test]
+fn same_dir_same_movie_plans_into_one_group() {
+    let files = kotonoha();
+    let plan = plan_movie_versions(&files);
+    assert_eq!(plan.groups.len(), 1, "{plan:?}");
+    let g = &plan.groups[0];
+    assert_eq!(g.primary, 1, "2160p 那份应当选主体（默认播放版本）：{g:?}");
+    assert_eq!(g.extra, vec![0]);
+    assert_eq!(plan.owner, vec![Some(0), Some(0)]);
+}
+
+/// 回归：单文件目录不能产出任何组，行为必须与归并前逐字等价。
+#[test]
+fn single_file_dir_has_no_version_group() {
+    let files = vec![scan_file(
+        "D:/m/Inception/Inception.2010.mkv",
+        "Inception",
+        MediaKind::Movie,
+        Some(2010),
+        10,
+    )];
+    let plan = plan_movie_versions(&files);
+    assert!(plan.groups.is_empty(), "{plan:?}");
+    assert_eq!(plan.owner, vec![None]);
+}
+
+/// 回归：同一个目录里是**两部**片子时绝不能并（沙丘 1984 与 沙丘 2021）。
+#[test]
+fn same_dir_different_movies_stay_apart() {
+    let files = vec![
+        scan_file("D:/m/沙丘/沙丘.1080p.mkv", "沙丘", MediaKind::Movie, Some(1984), 1),
+        scan_file("D:/m/沙丘/沙丘.1080p.mkv2", "沙丘 2", MediaKind::Movie, Some(2021), 1),
+    ];
+    let plan = plan_movie_versions(&files);
+    assert!(plan.groups.is_empty(), "不同片名不应归并：{plan:?}");
+}
+
+/// 同片但年份冲突 → 整桶不归并（宁可留着，也不能把重拍并成一条）。
+#[test]
+fn same_title_conflicting_years_are_not_merged() {
+    let files = vec![
+        scan_file("D:/m/沙丘/a.mkv", "沙丘", MediaKind::Movie, Some(1984), 1),
+        scan_file("D:/m/沙丘/b.mkv", "沙丘", MediaKind::Movie, Some(2021), 1),
+    ];
+    let plan = plan_movie_versions(&files);
+    assert!(plan.groups.is_empty(), "年份冲突应整桶放弃：{plan:?}");
+}
+
+/// 跨目录的同名文件是两部片子：目录是最强归属证据，绝不能跨目录并。
+#[test]
+fn same_title_across_dirs_is_not_merged() {
+    let files = vec![
+        scan_file("D:/m/A/x.mkv", "言叶之庭", MediaKind::Movie, Some(2013), 1),
+        scan_file("D:/m/B/x.mkv", "言叶之庭", MediaKind::Movie, Some(2013), 1),
+    ];
+    let plan = plan_movie_versions(&files);
+    assert!(plan.groups.is_empty(), "跨目录不应归并：{plan:?}");
+}
+
+/// 核心场景：同目录同片的多文件只占**一个**条目，默认播放版本是画质最好的那份。
+#[test]
+fn same_dir_same_movie_becomes_one_entry_with_versions() {
+    let mut conn = memory_db();
+    let roots = vec!["D:/m".to_string()];
+    let mut files = kotonoha();
+    files.push(scan_file(
+        "D:/m/Inception/Inception.2010.mkv",
+        "Inception",
+        MediaKind::Movie,
+        Some(2010),
+        10,
+    ));
+
+    let stats = import(&mut conn, &files, &roots).expect("导入应成功");
+    assert_eq!(stats.added_movies, 2, "言叶之庭 + Inception 两条：{stats:?}");
+    assert_eq!(stats.added_versions, 1, "第二个文件应并入当版本：{stats:?}");
+    assert_eq!(stats.merged_entries, 0, "新库没有存量条目可收编：{stats:?}");
+
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 2, "同目录同片只应占一个条目");
+
+    let (host_path, host_res): (String, Option<String>) = conn
+        .query_row(
+            "SELECT file_path, resolution FROM media WHERE title = '言叶之庭'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        host_path.ends_with("言叶之庭.2013.2160p.mkv"),
+        "默认播放版本应是画质最好的那份：{host_path}"
+    );
+    assert_eq!(host_res, None, "版本各自的分辨率不写进条目主体");
+
+    let vers: Vec<(i64, i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT season, episode, file_path FROM episodes ORDER BY episode")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(vers.len(), 1, "只有一份附加版本：{vers:?}");
+    assert_eq!(vers[0].0, 0, "版本落在第 0 季（电影没有季）：{vers:?}");
+    assert!(vers[0].2.ends_with("言叶之庭.2013.BD1080p.mkv"), "{vers:?}");
+}
+
+/// 重扫幂等：第二次导入不应再造版本行，也不该重复计数。
+#[test]
+fn rescan_after_merge_is_idempotent() {
+    let mut conn = memory_db();
+    let roots = vec!["D:/m".to_string()];
+    let files = kotonoha();
+
+    let first = import(&mut conn, &files, &roots).expect("首次导入应成功");
+    assert_eq!(first.added_movies, 1);
+    assert_eq!(first.added_versions, 1);
+
+    let second = import(&mut conn, &files, &roots).expect("重复导入应成功");
+    assert_eq!(second.added_movies, 0, "条目已存在：{second:?}");
+    assert_eq!(second.added_versions, 0, "版本行已存在：{second:?}");
+    assert_eq!(second.skipped, 2, "两个文件都应计为已存在：{second:?}");
+
+    let (media_n, ep_n): (i64, i64) = (
+        conn.query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0)).unwrap(),
+        conn.query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0)).unwrap(),
+    );
+    assert_eq!((media_n, ep_n), (1, 1));
+}
+
+/// 存量自愈：旧版本把同目录同片建成多条独立条目，重扫后要并成一条。
+#[test]
+fn legacy_scattered_movie_rows_are_merged_on_rescan() {
+    let mut conn = memory_db();
+    let roots = vec!["D:/m".to_string()];
+    let files = kotonoha();
+    // 前提：旧逻辑下每个文件各自一条独立条目
+    for f in &files {
+        insert_single(&conn, "movie", f, 1).unwrap();
+    }
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, 2, "前提：旧逻辑下是两个独立条目");
+
+    let stats = import(&mut conn, &files, &roots).expect("重扫应成功");
+    assert_eq!(stats.merged_entries, 1, "应把多出来的那条收编掉：{stats:?}");
+
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 1, "墙上只剩一张卡片");
+
+    let left: String = conn
+        .query_row("SELECT file_path FROM media", [], |r| r.get(0))
+        .unwrap();
+    assert!(left.ends_with("2160p.mkv"), "留下的是主体：{left}");
+}
+
+/// 守卫：用户编辑过（`locked = 1`）的散落条目**不能**被删掉。
+#[test]
+fn locked_scattered_row_is_not_deleted() {
+    let mut conn = memory_db();
+    let roots = vec!["D:/m".to_string()];
+    let files = kotonoha();
+    for f in &files {
+        insert_single(&conn, "movie", f, 1).unwrap();
+    }
+    conn.execute(
+        "UPDATE media SET locked = 1 WHERE file_path LIKE '%BD1080p%'",
+        [],
+    )
+    .unwrap();
+
+    let stats = import(&mut conn, &files, &roots).expect("重扫应成功");
+    assert_eq!(stats.merged_entries, 0, "锁定的条目不能动：{stats:?}");
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 2, "宁可留一张多余的卡片，也不能删用户的数据");
+}
+
+/// 收编前先把被删条目身上**主机缺的**元数据搬过去（只补缺失，绝不覆盖）。
+#[test]
+fn metadata_of_merged_row_is_carried_to_host() {
+    let mut conn = memory_db();
+    let roots = vec!["D:/m".to_string()];
+    let files = kotonoha();
+    for f in &files {
+        insert_single(&conn, "movie", f, 1).unwrap();
+    }
+    // 被收编的那条（1080p）刮过元数据；主体（2160p）没有
+    conn.execute(
+        "UPDATE media SET tmdb_id = 141214, poster_path = '/koto.jpg' \
+          WHERE file_path LIKE '%BD1080p%'",
+        [],
+    )
+    .unwrap();
+
+    import(&mut conn, &files, &roots).expect("重扫应成功");
+
+    let (tmdb, poster): (Option<i64>, Option<String>) = conn
+        .query_row("SELECT tmdb_id, poster_path FROM media", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(tmdb, Some(141214), "TMDB 绑定不该跟着删除一起丢");
+    assert_eq!(poster.as_deref(), Some("/koto.jpg"), "海报不该跟着删除一起丢");
+}
+
+/// 扫描侧的裸删也必须先把子级过继出去。
+///
+/// 之前只有「批量删除」做了过继，扫描收编 / 空壳清理是裸删 `media` 的：
+/// 用户把一个（看起来没人要的）自动条目拖成了聚合父条目之后，一次重扫就能
+/// 把它删掉，留下一串指向已删行的 `parent_id`。
+#[test]
+fn dropping_shells_adopts_children_before_delete() {
+    let conn = memory_db();
+    let ts = now_epoch();
+    // 空壳：tv、有 group_key、没有任何元数据、名下没有单集
+    conn.execute(
+        "INSERT INTO media (id, type, title, group_key, added_at, updated_at) \
+         VALUES (1, 'tv', '空壳', 'g', ?1, ?1)",
+        params![ts],
+    )
+    .unwrap();
+    // 被用户聚合进这个空壳的条目：它自己有海报，不会被当成空壳删掉
+    conn.execute(
+        "INSERT INTO media (id, type, title, parent_id, poster_path, added_at, updated_at) \
+         VALUES (2, 'movie', '被聚合进来的', 1, '/p.jpg', ?1, ?1)",
+        params![ts],
+    )
+    .unwrap();
+
+    assert_eq!(drop_empty_series_shells(&conn, "g").unwrap(), 1);
+
+    let parent: Option<i64> = conn
+        .query_row("SELECT parent_id FROM media WHERE id = 2", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(parent, None, "父行被删前，子级必须已经挂回顶层");
+    let dangling: i64 = conn
+        .query_row("SELECT COUNT(*) FROM media WHERE parent_id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(dangling, 0, "不能留下指向已删行的悬挂引用");
 }

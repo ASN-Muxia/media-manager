@@ -1,0 +1,103 @@
+classDiagram
+    class SortBy {
+        <<enumeration>>
+        name
+        year
+        added
+    }
+    class SortDir {
+        <<enumeration>>
+        asc
+        desc
+    }
+    class SortableItem {
+        <<interface>>
+        +number id
+        +string type
+        +string title
+        +string display_title
+        +number|null year
+        +number added_at
+        +string|null original_title
+        +string|null file_name
+    }
+    class MediaItem {
+        +number tmdb_id
+        +string poster_path
+        +number episode_count
+    }
+    class NameKey {
+        +readonly number[] stream
+    }
+    class HanOrder {
+        <<type>>
+        +ReadonlyMap~string,number~ rank
+    }
+    class SortUtil {
+        <<module: src/utils/sort.ts>>
+        +normalizeSortBy(v) SortBy
+        +normalizeSortDir(v) SortDir
+        +rawTitleOf(it) string
+        +hanCollatorUsable() bool
+        +buildHanOrder(titles) HanOrder
+        +nameKeyOf(it, han) NameKey
+        +buildNameKeys(items, han) Map
+        +compareNameKey(a, b) number
+        +identified(it) bool
+        +compareItems(a, b, by, dir, han, keys) number
+        +sortMediaItems(items, by, dir, han) T[]
+    }
+    class MediaStore {
+        <<pinia setup store>>
+        +MediaItem[] items
+        +string keyword
+        +HanOrder hanOrder$
+        +MediaItem[] orderedItems$
+        +visibleItems() MediaItem[]
+        +toggleSelectAll() void
+        +invertSelection() void
+        +pruneSelection() void
+    }
+    class SettingsStore {
+        <<pinia setup store>>
+        +SortBy sortBy
+        +SortDir sortDir
+        +bool loaded
+        +load() Promise
+        +save() Promise
+    }
+    class Settings {
+        <<rust: commands::settings::Settings>>
+        +String sort_by
+        +String sort_dir
+        +get_settings() Settings
+        +set_settings(s) Result
+        -normalize_sort(v, allowed, fallback) String
+    }
+    class AppVue {
+        <<component>>
+        +onSortBy(v) Promise
+        +onToggleSortDir() Promise
+        -persistSort() Promise
+        -inSettings bool
+        -inTree bool
+    }
+    class PosterGrid {
+        <<component>>
+        +MediaItem[] items
+    }
+
+    MediaItem ..|> SortableItem : 结构子集（天然满足）
+    SortUtil ..> SortableItem : 只读
+    SortUtil ..> NameKey : 生成
+    SortUtil ..> HanOrder : 生成/消费
+    SortUtil ..> SortBy : 使用
+    SortUtil ..> SortDir : 使用
+    SettingsStore ..> SortUtil : normalizeSortBy / normalizeSortDir
+    SettingsStore ..> Settings : getSettings / setSettings
+    MediaStore ..> SettingsStore : 读 sortBy / sortDir
+    MediaStore ..> SortUtil : buildHanOrder / sortMediaItems
+    MediaStore ..> MediaItem : 持有
+    AppVue ..> SettingsStore : 切换 + save()
+    AppVue ..> MediaStore : visibleItems()
+    AppVue ..> PosterGrid : :items

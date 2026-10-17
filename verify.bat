@@ -10,7 +10,7 @@ rem    2. 前端类型检查    tsc --noEmit
 rem    3. 前端单元测试    vitest run
 rem    4. Rust 测试       cargo test
 rem    5. Rust 编译链接   cargo build
-rem    6. 分发包冒烟       scripts/package.mjs --dry
+rem    6. 分发包冒烟       mjs\build\package.mjs --dry
 rem  全部通过则退出码为 0。
 rem
 rem  本文件为 GBK 编码，请勿用 UTF-8 覆盖保存，否则 cmd 解析会出错。
@@ -48,32 +48,37 @@ echo.
 if not exist "%MM_NODE%" goto :err_node
 if not exist "%MM_CARGO%" goto :err_cargo
 
-echo [1/6] 前端构建 (vite build)
+echo [1/7] 前端构建 (vite build)
 call :fe_build
 if errorlevel 1 set "MM_FAIL=1"
 echo.
 
-echo [2/6] 前端类型检查 (tsc --noEmit)
+echo [2/7] 前端类型检查 (tsc --noEmit)
 call :fe_typecheck
 if errorlevel 1 set "MM_FAIL=1"
 echo.
 
-echo [3/6] 前端单元测试 (vitest run)
+echo [3/7] 前端单元测试 (vitest run)
 call :fe_test
 if errorlevel 1 set "MM_FAIL=1"
 echo.
 
-echo [4/6] Rust 单元与集成测试 (cargo test)
+echo [4/7] Rust 单元与集成测试 (cargo test)
 call :rust_test
 if errorlevel 1 set "MM_FAIL=1"
 echo.
 
-echo [5/6] Rust 编译与链接 (cargo build)
+echo [5/7] Rust 编译与链接 (cargo build)
 call :rust_build
 if errorlevel 1 set "MM_FAIL=1"
 echo.
 
-echo [6/6] 分发打包冒烟 (scripts/package.mjs --dry)
+echo [6/7] 分层合规检查 (core 不得反向依赖 commands/provider)
+call :layering
+if errorlevel 1 set "MM_FAIL=1"
+echo.
+
+echo [7/7] 分发打包冒烟 (mjs\build\package.mjs --dry)
 call :pack_smoke
 if errorlevel 1 set "MM_FAIL=1"
 echo.
@@ -105,11 +110,11 @@ set "MM_RC=%ERRORLEVEL%"
 popd
 exit /b %MM_RC%
 
-rem 前端单测走 scripts/run-tests.mjs：它先把临时目录指到项目内再拉起 vitest，
+rem 前端单测走 mjs\dev\run-tests.mjs：它先把临时目录指到项目内再拉起 vitest，
 rem 直接调 vitest 会因为系统临时目录不可写而 EPERM。
 :fe_test
 pushd "%MM_ROOT%"
-call "%MM_NODE%" scripts\run-tests.mjs
+call "%MM_NODE%" mjs\dev\run-tests.mjs
 set "MM_RC=%ERRORLEVEL%"
 popd
 exit /b %MM_RC%
@@ -125,10 +130,17 @@ exit /b %ERRORLEVEL%
 rem ------------------------------------------------------------------ 出错处理
 rem 打包脚本自己实现 ZIP/tar.gz 容器（不依赖外部 tar/zip/git），一旦写错，
 rem 出问题的包在别人机器上才会暴露。这里每次盘点都真跑一遍文件发现与清
-rem 单生成流程作为冒烟；容器格式的正确性由 scripts/package.spec.mjs 覆盖。
+rem 单生成流程作为冒烟；容器格式的正确性由 mjs\test\package.spec.mjs 覆盖。
+:layering
+pushd "%MM_ROOT%"
+call "%MM_NODE%" mjs\dev\check-layering.mjs
+set "MM_RC=%ERRORLEVEL%"
+popd
+exit /b %MM_RC%
+
 :pack_smoke
 pushd "%MM_ROOT%"
-call "%MM_NODE%" scripts\package.mjs --dry
+call "%MM_NODE%" mjs\build\package.mjs --dry
 set "MM_RC=%ERRORLEVEL%"
 popd
 exit /b %MM_RC%

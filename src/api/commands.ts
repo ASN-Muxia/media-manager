@@ -24,10 +24,36 @@ export interface MediaItem {
   added_at: number;
   /** 展示用标题：同名剧集会带目录名后缀（`剧名 · 目录名`） */
   display_title: string;
+  /** 刮削前由原始文件名派生的标题（英文原名等写法），检索要用它匹配 */
+  original_title?: string | null;
+  /** 分组键（通常是所在目录名），检索要能按目录名命中 */
+  group_key?: string | null;
   /** `scan`（扫描归纳出来的）/ `manual`（手动新建的 Series） */
   source?: string;
   /** 用户确认过分组后锁住，二次校正不再调整 */
   locked?: boolean;
+  /** 父节点 id（`null` = 顶层）。封面墙的拖拽聚合分组靠它判断归属。 */
+  parent_id?: number | null;
+  /** 直接子级条数；> 0 时卡片给「展开 / 折叠」控件。 */
+  child_count?: number;
+  /**
+   * 同一父节点内的**次序**（库里缺值按 0）。
+   *
+   * ⚠️ 它不是列表先后：列表先后是用户选的展示排序（默认按拼音名），
+   * `sort_order` 才是同级内用户手工调出来的次序。要按同级次序排的地方
+   * （详情页「聚合成员」的 ↑ / ↓）必须用它，不能拿 `orderedItems` 的下标顶替，
+   * 否则后端按库内序算出的新序与旧序一样，点了看不出变化。
+   */
+  sort_order?: number;
+  /**
+   * 条目在全表层级里的深度（顶层 = 0），**由后端用全表边表算出来**。
+   *
+   * 封面墙的拖拽放行判定必须用它：前端自己数深度时只看得见当前筛选到的
+   * 条目，父节点一旦被筛掉就会被当成"走到了根"→ 深度偏小 → 界面画「可放置」
+   * 并把请求发出去，后端却回「层级最多 4 层」。缺失（老后端 / 测试桩）才退回
+   * 前端自数，见 `PosterGrid.vue::depthOf`。
+   */
+  depth?: number;
 }
 
 /** 分类（左侧导航的大栏目）。**全部来自数据库，前端没有任何硬编码枚举。** */
@@ -163,6 +189,61 @@ export interface Settings {
   /** 视觉模型名；留空表示不启用视觉兜底 */
   llmVisionModel: string;
   llmVisionBaseUrl: string;
+  /**
+   * 被用户**关掉**的数据源 id 列表（如 `["douban"]`）。
+   *
+   * 与「Key 留空」不同：留空是「没配置」，这里是「配了但不用」。
+   * 只认注册表认识的 id（见 `listProviders`）；空数组 = 全部启用。
+   * 关掉一个源**不会**让后面的源提前（权威顺序固定）。
+   */
+  disabledProviders: string[];
+
+  // ── 手动匹配的筛选偏好 ──
+  /** 模糊匹配开关（关掉就只剩「完全一致」与「包含」） */
+  matchFuzzy: boolean;
+  /** 年份容差：0 = 必须同一年，1 = 前后一年也算命中 */
+  matchYearTolerance: number;
+  /** 排除词（逗号 / 换行分隔）：候选标题里出现任一个就整条剔除 */
+  matchBlacklist: string;
+  /** 一次最多拉多少条候选（TMDB 每页 20 条） */
+  matchLimit: number;
+
+  // ── 快捷键（组合键字符串，留空 = 不绑定） ──
+  /** 全选当前可见条目 */
+  shortcutSelectAll: string;
+  /** 反选 */
+  shortcutInvert: string;
+  /** 确认所选（列表：刮削所选；候选面板：应用所选） */
+  shortcutConfirm: string;
+  /** 清空选择 */
+  shortcutClear: string;
+
+  // ── 列表排序（展示层偏好，排序计算在前端 `utils/sort.ts`）──
+  /** 排序键：`name` 名称（拼音）/ `year` 上映·首播年份 / `added` 添加时间 */
+  sortBy: string;
+  /** 排序方向：`asc` 正序 / `desc` 倒序 */
+  sortDir: string;
+  /**
+   * 已被用户**手工排过序**的聚合（分组）id 列表。
+   *
+   * 只回答「这一组的次序是用户亲手定的吗」，与 `MediaItem.sort_order` 的数值
+   * **无关**：`sort_order` 会被任何一次 `move_nodes_sync`（含在封面墙上拖动
+   * 聚合）整组重编号成 `0..n-1`，所以「组里存在 > 0 的值」根本不能证明用户排过。
+   * 列表里的分组 → 按库内 `sort_order` 显示；不在列表里 → 按顶栏排序偏好显示。
+   */
+  manualOrderGroups: number[];
+  /**
+   * 被用户**亲手折叠**过的分组 id 列表（封面墙的展开态记忆）。
+   *
+   * 为什么不能只放在 `PosterGrid` 的 `ref` 里：封面墙挂在 `App.vue` 的
+   * `v-if/v-else` 链上，点开详情页会把它**卸载**，两个展开态 ref 随之销毁；
+   * 返回时组件重建，「新分组自动展开」那段 watch 又把一切摊开 —— 表现就是
+   * 「我上次明明收起来了，回来又全开了」。落库才能跨卸载存活。
+   *
+   * 只记**折叠**、不记展开：展开的分组会随刷新不断新增，存它等于存一份只增
+   * 不减、越删越脏的名单；折叠天然是少数派，语义也正是「否决了自动展开」。
+   */
+  collapsedGroups: number[];
 }
 
 /** 数据层自检信息（Rust 端 `db_info` 命令）。 */
@@ -207,6 +288,29 @@ export interface TmdbSearchItem {
   vote_average?: number | null;
   release_date?: string | null;
   first_air_date?: string | null;
+  /** 原标题（电影 `original_title` / 剧集 `original_name`）：多语言匹配靠它接住。 */
+  original_title?: string | null;
+  original_name?: string | null;
+  /** 匹配打分（`search_tmdb` 才会带；详情 / 缓存路径没有）。 */
+  match_score?: number | null;
+  /** 命中原因，例如「片名完全一致」「年份一致」。 */
+  match_reasons?: string[] | null;
+}
+
+/** 手动匹配的筛选条件（与后端的 `MatchOptions` 对应）。 */
+export interface MatchFilter {
+  /** 本地原标题 / 别名，用于多语言比对。 */
+  originalTitle?: string | null;
+  /** 季数：剧集用它推断首播年份。 */
+  season?: number | null;
+  /** 一次最多拉多少条候选。 */
+  limit?: number | null;
+  /** 模糊匹配开关。 */
+  fuzzy?: boolean | null;
+  /** 年份容差（0 = 必须同一年）。 */
+  yearTolerance?: number | null;
+  /** 排除词：候选标题里出现任一个就整条剔除。 */
+  blacklist?: string | null;
 }
 
 export interface ScrapeOutcome {
@@ -403,34 +507,6 @@ export function getMediaList(query: MediaQuery = {}): Promise<MediaItem[]> {
   });
 }
 
-/**
- * 系列电影合集（派生视图：由电影标题算出来，不改数据）。
- *
- * 成员默认按上映时间升序；`duplicateCount` 是被折叠掉的「同片多版本」条数。
- */
-export interface MovieCollection {
-  key: string;
-  name: string;
-  movies: CollectionMovie[];
-  duplicateCount: number;
-  startYear: number | null;
-  endYear: number | null;
-}
-
-/** 合集里的一部电影。 */
-export interface CollectionMovie {
-  id: number;
-  title: string;
-  year: number | null;
-  poster_path: string | null;
-  file_path: string | null;
-}
-
-/** 系列电影合集列表。空数组表示库里还没有能凑成合集的系列。 */
-export function getMovieCollections(): Promise<MovieCollection[]> {
-  return invoke<MovieCollection[]>("get_movie_collections");
-}
-
 /** 重新识别存量数据的结果（界面直接展示这几个数字）。 */
 export interface ReclassifyResult {
   /** 参与重新判定的条目数（媒体行 + 单集行） */
@@ -467,6 +543,8 @@ export interface CreateMediaInput {
   overview?: string | null;
   categoryIds?: number[];
   tagNames?: string[];
+  /** 父节点 id；不传表示建在顶层 */
+  parentId?: number | null;
 }
 
 /** 从文件夹导入的结果（界面直接展示这几个数字）。 */
@@ -483,6 +561,8 @@ export interface ImportFolderResult {
   repointed: number;
   /** 清理掉的空剧集条目数 */
   droppedShells: number;
+  /** 散落条目（电影 / 待确认）被收编成单集的条数 */
+  adopted: number;
   message: string;
 }
 
@@ -537,6 +617,7 @@ export function createMedia(input: CreateMediaInput): Promise<MediaItem> {
     overview: input.overview ?? null,
     categoryIds: input.categoryIds ?? null,
     tagNames: input.tagNames ?? null,
+    parentId: input.parentId ?? null,
   });
 }
 
@@ -589,12 +670,29 @@ export function getScanHistory(limit = 20): Promise<ScanHistoryItem[]> {
 
 /* ------------------------ 模块④ 刮削 ------------------------ */
 
+/**
+ * 搜索 TMDB 候选。
+ *
+ * 返回类型与旧版一致（`TmdbSearchItem[]`），只是按匹配度排好了序、
+ * 并带上了 `match_score` / `match_reasons`。
+ */
 export function searchTmdb(
   mediaType: MediaType,
   query: string,
   year?: number | null,
+  filter?: MatchFilter | null,
 ): Promise<TmdbSearchItem[]> {
-  return invoke<TmdbSearchItem[]>("search_tmdb", { mediaType, query, year: year ?? null });
+  return invoke<TmdbSearchItem[]>("search_tmdb", {
+    mediaType,
+    query,
+    year: year ?? null,
+    originalTitle: filter?.originalTitle ?? null,
+    season: filter?.season ?? null,
+    limit: filter?.limit ?? null,
+    fuzzy: filter?.fuzzy ?? null,
+    yearTolerance: filter?.yearTolerance ?? null,
+    blacklist: filter?.blacklist ?? null,
+  });
 }
 
 export function scrapeMedia(id: number, tmdbId?: number | null): Promise<ScrapeOutcome> {
@@ -746,3 +844,364 @@ export function playMedia(path: string): Promise<string> {
 export function revealInExplorer(path: string): Promise<void> {
   return invoke<void>("reveal_in_explorer", { path });
 }
+
+/* ---------------------------- 层级（分组） ---------------------------- */
+/*
+ * 层级**不再单独占一个栏目/视图**：`parent_id` 这层关系留在数据里，
+ * 由封面墙按它聚合出分组（拖拽聚合），详情页里管理成员与顺序。
+ * 所以这里不再有"取整棵树"的入口——建树是 `utils/tree.ts` 的纯函数，
+ * 喂给它的是封面墙那份 `MediaItem` 补出来的节点。
+ */
+
+/**
+ * 分组树上的一个节点。
+ *
+ * 现在由封面墙 / 详情页用 `MediaItem` 现补出来（`utils/tree` 只认这个形状），
+ * 后端也不再单独给"取整棵树"的接口——一份数据只在前端建一次树，
+ * 避免两端各拼一份导致顺序不一致。
+ */
+export interface MediaTreeNode {
+  id: number;
+  parent_id: number | null;
+  sort_order: number;
+  type: MediaType;
+  title: string;
+  /** 同名剧集带目录名后缀，与海报墙一致 */
+  display_title: string;
+  year: number | null;
+  poster_path: string | null;
+  episode_count: number;
+  child_count: number;
+  /** 顶层 = 0 */
+  depth: number;
+  source: string;
+  locked: boolean;
+}
+
+/** 层级操作的结果（含撤销栈剩余步数，前端据此禁用「撤销」）。 */
+export interface TreeOpResult {
+  message: string;
+  undo_depth: number;
+}
+
+/** 允许的层级数（与 Rust `core::tree::MAX_DEPTH` 一致）。 */
+export const TREE_MAX_DEPTH = 4;
+
+/**
+ * 把一批条目搬到目标节点下（聚合 / 解除分组 / 组内排序，全走这一条）。
+ *
+ * `targetParentId` 为 `null` 表示顶层；`index` 为目标同级中的位置（省略 = 末尾）。
+ * 子孙会跟着一起搬；非法放置（自身 / 子孙 / 超层）由后端拒绝并给出原因。
+ *
+ * 电影与剧集走**完全相同**的一条路径：后端 `load_edges` 不按类型过滤，
+ * 所以两端行为、交互、数据结构天然一致。
+ */
+export function moveMediaNodes(args: {
+  ids: number[];
+  targetParentId: number | null;
+  index?: number | null;
+}): Promise<TreeOpResult> {
+  return invoke<TreeOpResult>("move_media_nodes", {
+    ids: args.ids,
+    targetParentId: args.targetParentId,
+    index: args.index ?? null,
+  });
+}
+
+/** 撤销最后一次层级操作（移动 / 聚合 / 解除分组 / 组内排序）。 */
+export function undoTreeOp(): Promise<TreeOpResult> {
+  return invoke<TreeOpResult>("undo_tree_op");
+}
+
+/* -------------------- 观看状态 / 续播 / 连播（v6） -------------------- */
+
+/**
+ * 一个条目的观看摘要。
+ *
+ * 口径必须说清楚：这是**集级**进度，不是秒级。
+ * 本软件调用外部播放器（PotPlayer），播放器进程不会把播放位置回传给我们，
+ * 所以「看到第 3 分 12 秒」这种精度本期拿不到——「继续播放」= 播下一个未看集。
+ */
+export interface MediaPlayback {
+  mediaId: number;
+  watched: boolean;
+  watchedEpisodes: number;
+  totalEpisodes: number;
+  playCount: number;
+  lastPlayedAt: number | null;
+  resumeEpisodeId: number | null;
+  lastEpisodeId: number | null;
+  lastSeason: number | null;
+  lastEpisode: number | null;
+  /**
+   * **上次真正播放过**的那一集（只看播放时间，不看「已看」）。
+   *
+   * 双击封面播放要的目标：`record_play` 播放后不写 `watched`，所以拿
+   * `lastEpisodeId` 会漏掉「播了但没标记已看」——那才是最常见的状态。
+   */
+  lastPlayedEpisodeId: number | null;
+}
+
+/** 连播 / 播放单集的结果。 */
+export interface PlayResult {
+  player: string;
+  files: number;
+  mediaId: number;
+  episodeId: number | null;
+  /** 实际播放那一集的季 / 集号（界面提示用）；电影为 null。 */
+  season: number | null;
+  episode: number | null;
+}
+
+export function getPlayback(mediaId: number): Promise<MediaPlayback> {
+  return invoke<MediaPlayback>("get_playback", { mediaId });
+}
+
+/** 批量取（列表页一次拿全，避免逐条请求）。 */
+export function getPlaybackMany(
+  mediaIds: number[],
+): Promise<Record<string, MediaPlayback>> {
+  return invoke<Record<string, MediaPlayback>>("get_playback_many", { mediaIds });
+}
+
+/** 最近播放（「继续观看」用）。 */
+export function recentPlayback(limit?: number): Promise<MediaPlayback[]> {
+  return invoke<MediaPlayback[]>("recent_playback", { limit: limit ?? null });
+}
+
+export function markWatched(args: {
+  mediaId: number;
+  episodeId?: number | null;
+  watched: boolean;
+}): Promise<MediaPlayback> {
+  return invoke<MediaPlayback>("mark_watched", {
+    mediaId: args.mediaId,
+    episodeId: args.episodeId ?? null,
+    watched: args.watched,
+  });
+}
+
+export function markWatchedBatch(mediaIds: number[], watched: boolean): Promise<number> {
+  return invoke<number>("mark_watched_batch", { mediaIds, watched });
+}
+
+/** 手动修正播放位置（秒）。本期不自动采集，但允许用户自己填。 */
+export function setPlaybackPosition(args: {
+  mediaId: number;
+  episodeId?: number | null;
+  positionSecs?: number | null;
+  durationSecs?: number | null;
+}): Promise<MediaPlayback> {
+  return invoke<MediaPlayback>("set_playback_position", {
+    mediaId: args.mediaId,
+    episodeId: args.episodeId ?? null,
+    positionSecs: args.positionSecs ?? null,
+    durationSecs: args.durationSecs ?? null,
+  });
+}
+
+export function clearPlayback(mediaId: number): Promise<MediaPlayback> {
+  return invoke<MediaPlayback>("clear_playback", { mediaId });
+}
+
+/**
+ * 播放某一集；`continuous` 为真时从这一集开始连播。
+ *
+ * 连播**不生成临时播放列表文件**——直接把多个路径作为参数交给播放器，
+ * 避免在用户的媒体目录里留下任何东西。
+ */
+export function playEpisode(args: {
+  mediaId: number;
+  episodeId?: number | null;
+  continuous?: boolean;
+}): Promise<PlayResult> {
+  return invoke<PlayResult>("play_episode", {
+    mediaId: args.mediaId,
+    episodeId: args.episodeId ?? null,
+    continuous: args.continuous ?? false,
+  });
+}
+
+/* -------------------- NFO 互通 / 备份（v6） -------------------- */
+
+export interface ExportResult {
+  written: number;
+  skipped: number;
+  failed: number;
+  message: string;
+}
+
+export interface ImportResult {
+  scanned: number;
+  filled: number;
+  reclassified: number;
+  unmatched: number;
+  message: string;
+}
+
+/**
+ * 导出 NFO。
+ *
+ * `targetDir` 省略时写在媒体文件旁边（Kodi / tMM 的 sidecar 约定）。
+ * `overwrite` 默认 false：已存在的 NFO 一律跳过，绝不覆盖用户或别的软件写的。
+ */
+export function exportNfo(args: {
+  /** 留空 = 导出全库；传了 id 就只导这几条。 */
+  mediaIds?: number[];
+  targetDir?: string | null;
+  overwrite?: boolean;
+}): Promise<ExportResult> {
+  return invoke<ExportResult>("export_nfo", {
+    mediaIds: args.mediaIds ?? [],
+    targetDir: args.targetDir ?? null,
+    overwrite: args.overwrite ?? false,
+  });
+}
+
+/** 从一个目录导入 NFO（只回填空字段，不覆盖已有值）。 */
+export function importNfo(dir: string): Promise<ImportResult> {
+  return invoke<ImportResult>("import_nfo", { dir });
+}
+
+/** 备份数据库到指定路径（目标已存在则拒绝，绝不覆盖）。 */
+export function backupDatabase(dest: string): Promise<string> {
+  return invoke<string>("backup_database", { dest });
+}
+
+/* -------------------- 维护 / 诊断（v6） -------------------- */
+
+export interface LibraryHealth {
+  dbPath: string;
+  schemaVersion: number;
+  tables: string[];
+  /** FTS5 检索索引是否可用（SQLite 可能没编进去，此时检索回落到 LIKE）。 */
+  ftsEnabled: boolean;
+  cacheRows: number;
+  playbackRows: number;
+  ffprobeAvailable: boolean;
+  os: string;
+  arch: string;
+}
+
+export function libraryHealth(): Promise<LibraryHealth> {
+  return invoke<LibraryHealth>("library_health");
+}
+
+/** 清理元数据缓存；不传 provider 则清空全部。 */
+export function clearMetadataCache(provider?: string | null): Promise<number> {
+  return invoke<number>("clear_metadata_cache", { provider: provider ?? null });
+}
+
+export function purgeExpiredCache(): Promise<number> {
+  return invoke<number>("purge_expired_cache");
+}
+
+/** provider 注册表（顺序即权威顺序）。 */
+export interface ProviderEntry {
+  id: string;
+  label: string;
+  provides: string;
+  defaultOn: boolean;
+}
+
+export function listProviders(): Promise<{ order: string[]; items: ProviderEntry[] }> {
+  return invoke<{ order: string[]; items: ProviderEntry[] }>("list_providers");
+}
+
+/* -------------------- 资源目录库（增量对比） -------------------- */
+
+/**
+ * 资源目录库里的一条记录（与 Rust `CatalogEntry` 对应，后端 camelCase 序列化）。
+ *
+ * 它是**文件系统视角**的清单，和 `media` 表不是一回事：文件还在不在、大小与
+ * 修改时间有没有变，都看这里。`mediaId` / `displayTitle` 只是尽力关联到媒体库，
+ * 关联不上就是 `null`（界面显示「未关联」），不代表这条记录有问题。
+ */
+export interface CatalogEntry {
+  id: number;
+  /** 绝对路径 */
+  path: string;
+  fileName: string;
+  /** 相对所在扫描根的目录；根目录下的文件是空串 */
+  relDir: string;
+  rootPath: string;
+  /** 字节数 */
+  size: number;
+  /** 修改时间（Unix 秒）；取不到时为 null */
+  mtime: number | null;
+  /** `present` 文件还在 / `missing` 上次见过、这次没找到 */
+  status: "present" | "missing";
+  /** 关联到的媒体条目 id；关联不上为 null */
+  mediaId: number | null;
+  displayTitle: string | null;
+  mediaType: string | null;
+}
+
+/** 一次「检测资源库」的结果（界面直接展示这几个数字）。 */
+export interface CatalogSyncResult {
+  /** 开始 / 结束时间（Unix 秒） */
+  startedAt: number;
+  finishedAt: number;
+  /** 参与的扫描根数量 */
+  roots: number;
+  /** 本次遍历到的文件数 */
+  scanned: number;
+  /** 新入库的条数 */
+  added: number;
+  /** 指纹（大小 / 修改时间）变了的条数 */
+  updated: number;
+  /** 指纹没变、原样保留的条数 */
+  unchanged: number;
+  /** 本次判定为「文件已不在」的条数 */
+  missing: number;
+  /** 上次丢失、这次又找回来的条数 */
+  restored: number;
+  message: string;
+}
+
+/** 与上一次检测的差异（后端 `diff_resource_catalog`）。 */
+export interface CatalogDiff {
+  added: CatalogEntry[];
+  changed: CatalogEntry[];
+  missing: CatalogEntry[];
+  /** 当前在库总数 */
+  present: number;
+  /** 上一次检测时间（Unix 秒）；从未检测过为 null */
+  lastSyncAt: number | null;
+}
+
+/** 资源目录库的查询条件（与 `getMediaList` 的 `MediaQuery` 同一写法）。 */
+export interface CatalogQuery {
+  /** 最多返回多少条；不传 = 全部 */
+  limit?: number | null;
+  /** 只看在库 / 已丢失；不传 = 都要 */
+  status?: "present" | "missing" | null;
+  /** 文件名的模糊匹配 */
+  keyword?: string | null;
+}
+
+/**
+ * 检测资源库：遍历各扫描根，把结果**增量**写进后端的 `resource_snapshots` 表。
+ *
+ * 「增量」= 与上一次快照逐条比对：指纹没变的只更新「最近见到」的时间，变了的写
+ * 新指纹，这次没见到的标记为丢失。**只读文件系统**，不动媒体库里的条目。
+ * 跑完返回这一轮的统计，界面直接展示。
+ */
+export function syncResourceCatalog(): Promise<CatalogSyncResult> {
+  return invoke<CatalogSyncResult>("sync_resource_catalog");
+}
+
+/** 读资源目录库清单（筛选在 SQL 层做，前端不二次筛选）。 */
+export function getResourceCatalog(query: CatalogQuery = {}): Promise<CatalogEntry[]> {
+  return invoke<CatalogEntry[]>("get_resource_catalog", {
+    limit: query.limit ?? null,
+    status: query.status ?? null,
+    keyword: query.keyword?.trim() || null,
+  });
+}
+
+/** 与上一次检测对比：新增 / 变化 / 丢失 三组条目（「定位旧资源」靠它）。 */
+export function diffResourceCatalog(): Promise<CatalogDiff> {
+  return invoke<CatalogDiff>("diff_resource_catalog");
+}
+

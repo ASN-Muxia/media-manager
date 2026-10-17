@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
+import { nextTick } from "vue";
 import { useMediaStore } from "./mediaStore";
+import { useSettingsStore } from "./settingsStore";
 import type { MediaItem, ScanProgress } from "../api/commands";
 
 /**
@@ -31,7 +33,6 @@ const mocks = vi.hoisted(() => ({
   deleteMediaBatch: vi.fn(),
   deleteEpisodes: vi.fn(),
   importFolder: vi.fn(),
-  getMovieCollections: vi.fn(),
   reclassifyMedia: vi.fn(),
 }));
 
@@ -128,6 +129,29 @@ describe("mediaStore: 关键字过滤", () => {
     await s.load();
     s.keyword = "  inception  ";
     expect(s.visibleItems()).toHaveLength(1);
+  });
+
+  it("可按原始标题（英文原名）与目录名检索", async () => {
+    const s = useMediaStore();
+    mocks.getMediaList.mockResolvedValue([
+      item({
+        id: 3,
+        title: "流浪地球",
+        original_title: "The Wandering Earth",
+        group_key: "流浪地球 (2019)",
+      }),
+      item({ id: 4, title: "独行月球", original_title: "Moon Man" }),
+    ]);
+    await s.load();
+    // 修复前：只搜 display_title/title/genre/year，搜英文原名一条都中不了
+    s.keyword = "wandering";
+    expect(s.visibleItems().map((i) => i.id)).toEqual([3]);
+    // 目录名（group_key）也要能命中
+    s.keyword = "2019)";
+    expect(s.visibleItems().map((i) => i.id)).toEqual([3]);
+    // 普通关键词多结果匹配不受影响
+    s.keyword = "moon";
+    expect(s.visibleItems().map((i) => i.id)).toEqual([4]);
   });
 });
 
@@ -384,6 +408,92 @@ describe("mediaStore: 多选与批量删除", () => {
   });
 });
 
+/**
+ * 删除链路最容易出事的地方不是「删不掉」，而是**删多了 / 以为删了其实没删**：
+ * 选中集合里混进看不见的 id、删完之后脏 id 还留在集合里、条数对不上时闷声不响。
+ */
+describe("mediaStore: 删除链路（防误删 / 幂等 / 反馈）", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    mocks.getMediaList.mockResolvedValue([
+      item({ id: 1, title: "Inception", display_title: "Inception" }),
+      item({ id: 2, title: "Dune", display_title: "Dune" }),
+      item({ id: 3, title: "Arrival", display_title: "Arrival" }),
+    ]);
+    mocks.deleteMediaBatch.mockResolvedValue(0);
+    mocks.deleteMedia.mockResolvedValue(undefined);
+    mocks.getMediaDetail.mockResolvedValue(null);
+  });
+
+  it("改了关键字就剔掉被过滤掉的选中项，「删除所选」不会误删看不见的条目", async () => {
+    const s = useMediaStore();
+    await s.load();
+    s.setSelected([1, 2, 3]);
+    s.keyword = "dune";
+    await nextTick(); // watch 是异步的，断言前先让裁剪跑完
+
+    // 只有还看得见的那条继续选着
+    expect(s.selected).toEqual([2]);
+    mocks.deleteMediaBatch.mockResolvedValue(1);
+    await s.removeSelected();
+    expect(mocks.deleteMediaBatch).toHaveBeenCalledTimes(1);
+    // 绝不能把另外两条一起删掉
+    expect(mocks.deleteMediaBatch.mock.calls[0][0]).toEqual([2]);
+  });
+
+  it("单条删除后要把该 id 从选中集合里剔除", async () => {
+    const s = useMediaStore();
+    await s.load();
+    s.setSelected([1, 2]);
+    await s.remove(1);
+
+    // 留着已删的 id 会让下一次批量删除带着它再跑一趟
+    expect(s.selected).toEqual([2]);
+  });
+
+  it("实际删掉的条数少于请求数时要说清楚，不让用户以为漏删", async () => {
+    mocks.deleteMediaBatch.mockResolvedValue(2);
+    const s = useMediaStore();
+    await s.load();
+    s.setSelected([1, 2, 3]);
+    await s.removeSelected();
+
+    expect(s.toast).toBe("已删除 2 条资源，另有 1 条已不在库中");
+    // 删过的和本来就不存在的都要剔掉
+    expect(s.selected).toEqual([]);
+  });
+
+  it("按 id 删除只剔这一批，用户在别处的勾选不受影响", async () => {
+    mocks.deleteMediaBatch.mockResolvedValue(1);
+    const s = useMediaStore();
+    await s.load();
+    s.setSelected([1, 2, 3]);
+    await s.removeByIds([2]);
+
+    // 树视图删节点不该顺手清空海报墙上的勾选
+    expect(s.selected).toEqual([1, 3]);
+  });
+
+  it("重复 id 与非正 id 先在本地清掉，不麻烦后端", async () => {
+    mocks.deleteMediaBatch.mockResolvedValue(2);
+    const s = useMediaStore();
+    await s.load();
+    await s.removeByIds([1, 1, 0, -3, 2]);
+
+    expect(mocks.deleteMediaBatch).toHaveBeenCalledWith([1, 2]);
+  });
+
+  it("单条删除失败时如实报错，不谎报成功", async () => {
+    mocks.deleteMedia.mockRejectedValue(new Error("找不到 id 为 9 的资源，可能已经被删除了"));
+    const s = useMediaStore();
+    await s.load();
+    await s.remove(9);
+
+    expect(s.toast).toContain("移除失败");
+    expect(s.toast).toContain("找不到 id 为 9 的资源");
+  });
+});
+
 describe("mediaStore: 从文件夹导入与单集删减", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
@@ -447,11 +557,123 @@ describe("mediaStore: 从文件夹导入与单集删减", () => {
 });
 
 /**
- * 「待确认 / 系列合集 / 重新识别」三件事：
- * 类型判定改了规则，界面上必须能看到「哪些还没定下来」「哪些能凑成系列」，
+ * 列表排序：排序是**展示层**行为，只改内存顺序——不写媒体行、不碰文件、
+ * 也不改后端 `get_media_list` 的 ORDER BY。这里守三条：
+ * ① 分区恒为「已识别 → 未识别」；② 倒序只在分区内部生效；③ 过滤不改顺序。
+ */
+describe("mediaStore: 列表排序", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    vi.clearAllMocks();
+    mocks.getMediaList.mockResolvedValue([
+      item({ id: 1, title: "B", display_title: "B", year: 2000, added_at: 30 }),
+      item({ id: 2, title: "A", display_title: "A", year: 2010, added_at: 10 }),
+      // type 未知 → 未识别分区
+      item({ id: 3, type: "unknown", title: "D", display_title: "D", year: 2015, added_at: 20 }),
+      // 缺年份 → 未识别分区
+      item({ id: 4, title: "无年份", display_title: "无年份", year: null, added_at: 5 }),
+    ]);
+  });
+
+  /** 可见列表的 id 序列。 */
+  function visibleIds(s: ReturnType<typeof useMediaStore>): number[] {
+    return s.visibleItems().map((i) => i.id);
+  }
+
+  it("默认按名称正序：已识别在前，未识别沉底", async () => {
+    const s = useMediaStore();
+    await s.load();
+
+    expect(visibleIds(s)).toEqual([2, 1, 3, 4]);
+  });
+
+  /**
+   * `sort_order`（同级次序）是**数据**，不是展示顺序。
+   *
+   * 全局排序只认用户选的偏好；`sort_order` 要原样留在条目上，交给真正需要
+   * 它的地方（详情页「聚合成员」）自己排。若哪天有人把它接进 `orderedItems`，
+   * 用户选的排序就被悄悄改写了——那正是「成员 ↑↓ 无效果」这条 bug 的反面。
+   */
+  it("sort_order 不参与全局排序，但要原样留在条目上", async () => {
+    mocks.getMediaList.mockResolvedValue([
+      item({ id: 1, title: "A", display_title: "A", year: 2000, sort_order: 2 }),
+      item({ id: 2, title: "B", display_title: "B", year: 2000, sort_order: 0 }),
+    ]);
+    const s = useMediaStore();
+    await s.load();
+
+    // 默认按名称正序：A 在前，尽管它的 sort_order 更大
+    expect(visibleIds(s)).toEqual([1, 2]);
+    // 字段没被 store 吞掉，上层要用时取得到
+    expect(s.visibleItems().map((i) => i.sort_order)).toEqual([2, 0]);
+  });
+
+  it("按上映年份正序：旧→新，缺年份的在未识别分区末尾", async () => {
+    const st = useSettingsStore();
+    st.sortBy = "year";
+    const s = useMediaStore();
+    await s.load();
+
+    expect(visibleIds(s)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("按上映年份倒序：新→旧，未识别分区仍在最末", async () => {
+    const st = useSettingsStore();
+    st.sortBy = "year";
+    st.sortDir = "desc";
+    const s = useMediaStore();
+    await s.load();
+
+    const ids = visibleIds(s);
+    expect(ids).toEqual([2, 1, 3, 4]);
+    // 缺年份的那条（id 4）在任何方向下都是最后一条
+    expect(ids[ids.length - 1]).toBe(4);
+  });
+
+  it("按添加时间排序：两个方向都只在分区内部生效", async () => {
+    const st = useSettingsStore();
+    st.sortBy = "added";
+    const s = useMediaStore();
+    await s.load();
+
+    expect(visibleIds(s)).toEqual([2, 1, 4, 3]);
+
+    st.sortDir = "desc";
+    expect(visibleIds(s)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("关键字过滤只做过滤，不改变排序结果", async () => {
+    const st = useSettingsStore();
+    st.sortBy = "year";
+    st.sortDir = "desc";
+    const s = useMediaStore();
+    await s.load();
+    const before = visibleIds(s);
+
+    // 全部条目都有这个类型标签 → 一条都过滤不掉，顺序必须与过滤前完全一致
+    s.keyword = "科幻";
+    expect(visibleIds(s)).toEqual(before);
+  });
+
+  /** 排序后的列表就是用户看到的列表，多选必须作用在它上面（P0-7）。 */
+  it("全选作用于**排序后**的可见列表，顺序即显示顺序", async () => {
+    const st = useSettingsStore();
+    st.sortBy = "added";
+    st.sortDir = "asc";
+    const s = useMediaStore();
+    await s.load();
+
+    s.toggleSelectAll();
+    expect(s.selected).toEqual([2, 1, 4, 3]);
+  });
+});
+
+/**
+ * 「待确认 / 重新识别」两件事：
+ * 类型判定改了规则，界面上必须能看到「哪些还没定下来」，
  * 并且能一键把存量的错误分类修回来。
  */
-describe("mediaStore: 待确认 / 系列合集 / 重新识别", () => {
+describe("mediaStore: 待确认 / 重新识别", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
@@ -468,38 +690,6 @@ describe("mediaStore: 待确认 / 系列合集 / 重新识别", () => {
     expect(mocks.getMediaList).toHaveBeenCalledWith(
       expect.objectContaining({ mediaType: "unknown" }),
     );
-  });
-
-  it("切到「系列合集」时单独拉一份合集数据", async () => {
-    mocks.getMovieCollections.mockResolvedValue([
-      {
-        key: "dune",
-        name: "沙丘",
-        movies: [
-          { id: 1, title: "沙丘", year: 2021, poster_path: null, file_path: null },
-          { id: 2, title: "沙丘 2", year: 2024, poster_path: null, file_path: null },
-        ],
-        duplicateCount: 1,
-        startYear: 2021,
-        endYear: 2024,
-      },
-    ]);
-    const s = useMediaStore();
-    await s.setView("collections");
-
-    // 合集是派生视图，不是「另一种类型」，所以列表筛选仍落在全部上
-    expect(s.filter).toBe("all");
-    expect(s.collections).toHaveLength(1);
-    expect(s.collections[0].movies.map((m) => m.id)).toEqual([1, 2]);
-  });
-
-  it("合集加载失败时清空并报错，不留下上一栏的旧数据", async () => {
-    mocks.getMovieCollections.mockRejectedValue(new Error("查询失败"));
-    const s = useMediaStore();
-    await s.loadCollections();
-
-    expect(s.collections).toEqual([]);
-    expect(s.error).toContain("查询失败");
   });
 
   it("重新识别全库：不传 ids，结束后刷新列表", async () => {

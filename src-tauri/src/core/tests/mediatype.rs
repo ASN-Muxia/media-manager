@@ -273,6 +273,21 @@ fn episode_number_after_season_marker_is_recovered() {
     assert_eq!(trailing_number_of_file("Inception (2010) [1080p].mkv"), None);
 }
 
+/// 剧集主记录的展示标题：尾部集号必须剥掉（`大明风华 01` 入库后不能
+/// 显示成「大明风华01」），但年份与标题自带的数字不能被误剥。
+#[test]
+fn series_title_strips_trailing_episode_number_only() {
+    assert_eq!(series_title_of("大明风华 01"), "大明风华");
+    assert_eq!(series_title_of("哆啦A梦 1000"), "哆啦A梦");
+    assert_eq!(series_title_of("剧名 01v2"), "剧名", "带版本号的编号同样剥");
+    assert_eq!(series_title_of("西游记 1986"), "西游记 1986", "年份不是集号");
+    assert_eq!(series_title_of("西游记 2000"), "西游记 2000", "版本区间终点年也不剥");
+    assert_eq!(series_title_of("300勇士"), "300勇士", "标题自带的数字不能截断");
+    assert_eq!(series_title_of("大明风华"), "大明风华", "没有编号不动");
+    assert_eq!(series_title_of("01"), "01", "纯编号剥完为空要退回原标题");
+    assert_eq!(series_title_of("  大明风华 01  "), "大明风华", "前后空白要清理");
+}
+
 /// 特辑是剧集体系的一员（归第 0 季），不能被判成电影。
 #[test]
 fn chinese_special_marker_is_tv() {

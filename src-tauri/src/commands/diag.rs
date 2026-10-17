@@ -96,16 +96,85 @@ pub fn runtime_info(
     state: State<'_, Mutex<rusqlite::Connection>>,
 ) -> Result<serde_json::Value, String> {
     let conn = state.lock().map_err(|e| e.to_string())?;
-    let tables = db::tables(&conn)?;
+    health_payload(&app, &conn)
+}
+
+/* -------------------- 健康检查（v6 新增） -------------------- */
+
+/// 库的健康状况：结构版本、检索索引是否可用、缓存与观看状态的行数。
+///
+/// 暴露这些是为了让「检索为什么不快 / 缓存有没有生效」能被一眼看到，
+/// 而不是靠猜——尤其是 FTS5，它**可能没被编进 SQLite**，必须能查。
+#[tauri::command]
+pub fn library_health(
+    app: AppHandle,
+    state: State<'_, Mutex<rusqlite::Connection>>,
+) -> Result<serde_json::Value, String> {
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    health_payload(&app, &conn)
+}
+
+fn health_payload(
+    app: &AppHandle,
+    conn: &rusqlite::Connection,
+) -> Result<serde_json::Value, String> {
+    let tables = db::tables(conn)?;
     let schema: i32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    let db_file = db::db_path(&app)?.to_string_lossy().to_string();
+    let db_file = db::db_path(app)?.to_string_lossy().to_string();
+    let fts = crate::store::search::fts_ready(conn);
+    let cache_rows = crate::store::cache::count(conn).unwrap_or(0);
+    let playback_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM playback_state", [], |r| r.get(0))
+        .unwrap_or(0);
     Ok(serde_json::json!({
         "dbPath": db_file,
         "schemaVersion": schema,
         "tables": tables,
+        "ftsEnabled": fts,
+        "cacheRows": cache_rows,
+        "playbackRows": playback_rows,
+        "ffprobeAvailable": crate::provider::probe::available(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
     }))
+}
+
+/// 清理元数据缓存（设置页「维护」用）。传 provider 则只清那一个源。
+#[tauri::command]
+pub fn clear_metadata_cache(
+    state: State<'_, Mutex<rusqlite::Connection>>,
+    provider: Option<String>,
+) -> Result<i64, String> {
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    let n = match provider.as_deref() {
+        Some(p) if !p.trim().is_empty() => crate::store::cache::clear(&conn, Some(p.trim()))?,
+        _ => crate::store::cache::clear(&conn, None)?,
+    };
+    Ok(n as i64)
+}
+
+/// 清掉过期的缓存行（启动时或手动触发）。
+#[tauri::command]
+pub fn purge_expired_cache(
+    state: State<'_, Mutex<rusqlite::Connection>>,
+) -> Result<i64, String> {
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    Ok(crate::store::cache::purge_expired(&conn)? as i64)
+}
+
+/// 列出 provider 注册表与当前启用状态（设置页展示）。
+#[tauri::command]
+pub fn list_providers() -> Result<serde_json::Value, String> {
+    let reg = crate::provider::registry::entries();
+    let items: Vec<serde_json::Value> = reg
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id, "label": e.label, "provides": e.provides, "defaultOn": e.default_on,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "order": crate::provider::registry::ORDER, "items": items }))
 }

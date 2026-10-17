@@ -9,6 +9,101 @@ fn new_control() -> Arc<ScrapeControl> {
     Arc::new(ScrapeControl::default())
 }
 
+/* --------------------- 元数据缓存（接线验证） --------------------- */
+/*
+   怎么在不联网的前提下证明「缓存真的被用上了」：
+   客户端故意用一个**空 API Key** 构造 —— 这种客户端一旦真去发请求必然失败。
+   所以「调用成功且拿到预置的值」只能说明一件事：数据是**从缓存里读出来的**。
+*/
+
+/// 造一个不可能联网成功的客户端（空 Key）。
+fn offline_client() -> TmdbClient {
+    TmdbClient::with_hosts_and_language("", &[], "zh-CN")
+}
+
+#[test]
+fn cached_detail_serves_from_cache_without_network() {
+    let conn = memory_db();
+    let meta = crate::provider::tmdb::TmdbMeta {
+        tmdb_id: 7,
+        title: "缓存片".to_string(),
+        ..Default::default()
+    };
+    let key = cache_key(&["detail", "movie", "7"]);
+    cache::put(
+        &conn,
+        PROVIDER_TMDB,
+        &key,
+        &serde_json::to_string(&meta).unwrap(),
+        3600,
+    )
+    .unwrap();
+
+    let got = cached_detail(&conn, &offline_client(), "movie", 7).unwrap();
+    assert_eq!(got.title, "缓存片", "命中缓存时不该联网");
+}
+
+#[test]
+fn cached_search_serves_from_cache_without_network() {
+    let conn = memory_db();
+    let items = vec![crate::provider::tmdb::TmdbSearchItem {
+        id: 42,
+        title: Some("卧虎藏龙".to_string()),
+        ..Default::default()
+    }];
+    let key = cache_key(&["search", "movie", "卧虎藏龙", ""]);
+    cache::put(
+        &conn,
+        PROVIDER_TMDB,
+        &key,
+        &serde_json::to_string(&items).unwrap(),
+        3600,
+    )
+    .unwrap();
+
+    let got = cached_search(&conn, &offline_client(), "movie", "卧虎藏龙", None).unwrap();
+    assert_eq!(got[0].id, 42);
+}
+
+/// 缓存键必须带年份：同名的 1994 版与 2019 版不能互相顶掉。
+#[test]
+fn cache_key_includes_year() {
+    let a = cache_key(&["search", "movie", "狮子王", "1994"]);
+    let b = cache_key(&["search", "movie", "狮子王", "2019"]);
+    assert_ne!(a, b, "不同年份必须落在不同 key 上");
+}
+
+/// 缓存里的脏数据（结构升级过、被手工改过）必须当成 miss，
+/// 而不是把整个刮削流程弄崩 —— 这条路径上一次网络都没有，所以返回 None。
+#[test]
+fn corrupt_cache_entry_is_a_miss_not_a_panic() {
+    let conn = memory_db();
+    let key = cache_key(&["search", "movie", "坏数据", ""]);
+    cache::put(&conn, PROVIDER_TMDB, &key, "{not json", 3600).unwrap();
+
+    let got = cached_search(&conn, &offline_client(), "movie", "坏数据", None);
+    assert!(got.is_none(), "脏缓存按 miss 处理，随后联网失败 → None");
+}
+
+/// 过期条目不再算命中（`expires_at` 由 `cache::put` 按 TTL 算）。
+#[test]
+fn expired_cache_entry_is_not_served() {
+    let conn = memory_db();
+    let items = vec![crate::provider::tmdb::TmdbSearchItem { id: 1, ..Default::default() }];
+    let key = cache_key(&["search", "movie", "过期", ""]);
+    // TTL = 0 → 立即过期
+    cache::put(
+        &conn,
+        PROVIDER_TMDB,
+        &key,
+        &serde_json::to_string(&items).unwrap(),
+        0,
+    )
+    .unwrap();
+
+    assert!(cached_search(&conn, &offline_client(), "movie", "过期", None).is_none());
+}
+
 #[test]
 fn control_begin_resets_cancel_flag() {
     let c = new_control();
@@ -193,36 +288,84 @@ fn douban_only_configuration_is_valid() {
     put_setting(&conn, "doubanEnabled", "1");
     let p = Providers::load(&conn, "", vec![], "zh-CN");
     assert!(p.douban.is_some(), "开了豆瓣就该就位");
-    assert!(!p.has_tmdb(""), "没配 Key 时 has_tmdb 应为 false");
-    assert!(p.has_tmdb("k"));
+    assert!(!p.tmdb_on, "没配 Key 时 TMDb 不可用");
     assert!(p.tvdb.is_none() && p.fanart.is_none() && p.omdb.is_none());
 }
 
-/// 没配 TMDb Key 时，`has_tmdb` 决定提示语：不能还怪「未在 TMDB 找到」。
+/// 配了 TMDb Key 时 `tmdb_on` 才为真；**被用户关掉**（`disabledProviders`）
+/// 同样变成不可用——这两种情况都该让豆瓣接管，而不是直接失败。
+#[test]
+fn tmdb_on_requires_key_and_not_disabled() {
+    let conn = memory_db();
+
+    let p = Providers::load(&conn, "k", vec![], "zh-CN");
+    assert!(p.tmdb_on, "有 Key 且没关掉 → 可用");
+
+    put_setting(&conn, "disabledProviders", r#"["tmdb"]"#);
+    let p = Providers::load(&conn, "k", vec![], "zh-CN");
+    assert!(!p.tmdb_on, "用户关掉了 TMDb → 不可用（Key 还在，但不用）");
+}
+
+/// 关掉一个可选源只是让它缺席，**不会**让别的源顶上来。
+#[test]
+fn disabling_optional_sources_only_removes_them() {
+    let conn = memory_db();
+    put_setting(&conn, "tvdbKey", "t");
+    put_setting(&conn, "fanartKey", "f");
+    put_setting(&conn, "omdbKey", "o");
+    put_setting(&conn, "doubanEnabled", "1");
+
+    let all = Providers::load(&conn, "k", vec![], "zh-CN");
+    assert!(all.tvdb.is_some() && all.fanart.is_some() && all.omdb.is_some());
+    assert!(all.douban.is_some());
+
+    put_setting(&conn, "disabledProviders", r#"["fanart"]"#);
+    let some = Providers::load(&conn, "k", vec![], "zh-CN");
+    assert!(some.fanart.is_none(), "被关掉的源要缺席");
+    assert!(some.tvdb.is_some() && some.omdb.is_some() && some.douban.is_some(),
+        "关掉一个源不该影响其它源");
+    assert!(some.tmdb_on, "关掉 Fanart 更不该影响 TMDb");
+}
+
+/// 设置里塞了不存在的源 id 时必须被忽略，不能因为一个错字就让某个源消失。
+#[test]
+fn unknown_disabled_ids_are_ignored_by_providers_load() {
+    let conn = memory_db();
+    put_setting(&conn, "doubanEnabled", "1");
+    put_setting(&conn, "disabledProviders", r#"["llm","whatever"]"#);
+
+    let p = Providers::load(&conn, "k", vec![], "zh-CN");
+    assert!(p.douban.is_some() && p.tmdb_on);
+}
+
+/// TMDb 不可用时，提示语要说清是「没启用」而不是「没找到」——
+/// 否则用户会去 TMDB 那边白找一圈。
 ///
 /// ⚠️ 这条**不能真去请求豆瓣**——`douban_takeover` 里查不到客户端时会先返回，
-/// 所以这里只装「开了豆瓣 + 无 TMDb Key」的配置，然后断言提示语分支。
+/// 所以这里只装「没开豆瓣 + 各种 TMDb 状态」的配置，然后断言提示语分支。
 /// 真正的联网成功路径由 `provider/douban.rs` 的纯解析测试覆盖。
 #[test]
-fn douban_takeover_message_reflects_missing_tmdb_key() {
+fn douban_takeover_message_reflects_tmdb_state() {
     let conn = memory_db();
     let id = insert_media(&conn, "movie", "沙丘");
 
-    // ① 没开豆瓣 + 没配 TMDb Key → 提示要说明「未配置 TMDB API Key」
+    // ① 没配 TMDb Key → 提示要说明「TMDb 未启用」
     let p = Providers::load(&conn, "", vec![], "zh-CN");
     assert!(p.douban.is_none());
     let pending = read_pending(&conn, id).unwrap();
-    let out = douban_takeover(&conn, &p, "", id, pending, None).unwrap();
+    let out = douban_takeover(&conn, &p, id, pending, None).unwrap();
     assert!(!out.ok);
     assert_eq!(
         out.message,
-        "尚未配置 TMDB API Key，且未在豆瓣找到匹配条目",
-        "没配 Key 时不该说「未在 TMDB 找到匹配条目」"
+        "TMDb 未启用（没配 Key 或已关闭），且未在豆瓣找到匹配条目",
+        "TMDb 不可用时不该说「未在 TMDB 找到匹配条目」"
     );
 
     // ② 配了 TMDb Key → 保持加豆瓣之前的原文案（向后兼容）
+    let p = Providers::load(&conn, "tmdb-key", vec![], "zh-CN");
+    assert!(p.tmdb_on);
     let pending = read_pending(&conn, id).unwrap();
-    let out = douban_takeover(&conn, &p, "tmdb-key", id, pending, None).unwrap();
+    let out = douban_takeover(&conn, &p, id, pending, None).unwrap();
     assert_eq!(out.message, "未在 TMDB 找到匹配条目");
 }
 
@@ -460,7 +603,7 @@ fn douban_takeover_is_noop_without_client() {
     assert!(p.douban.is_none());
 
     let pending = read_pending(&conn, id).unwrap();
-    let out = douban_takeover(&conn, &p, "tmdb-key", id, pending, None).unwrap();
+    let out = douban_takeover(&conn, &p, id, pending, None).unwrap();
 
     assert!(!out.ok, "没启用豆瓣时应返回匹配失败");
     assert_eq!(out.message, "未在 TMDB 找到匹配条目", "文案要与加豆瓣之前一致");
@@ -479,7 +622,7 @@ fn douban_takeover_persists_llm_hint_on_total_miss() {
     let pending = read_pending(&conn, id).unwrap();
 
     let refined = Some(("沙丘".to_string(), Some(2021)));
-    let out = douban_takeover(&conn, &p, "tmdb-key", id, pending, refined).unwrap();
+    let out = douban_takeover(&conn, &p, id, pending, refined).unwrap();
     assert!(!out.ok);
 
     let (title, _, _, _) = read_fill_state(&conn, id);
@@ -666,4 +809,53 @@ fn douban_takeover_still_renames_ordinary_entries() {
     let fill = apply_douban_takeover(&conn, id, &sample_douban_meta()).unwrap();
     assert!(fill.fields.iter().any(|f| f == "片名"));
     assert_eq!(read_fill_state(&conn, id).0, "沙丘");
+}
+
+/* --------------------- TMDB id 的优先级链 --------------------- */
+
+/// 优先级：显式指定 > 入库时解析的 > 文本里现解析的（文件名 → 标题）。
+///
+/// 命中任何一级就**不再**走「标题 + 年份检索」的模糊匹配——这是本轮需求的核心：
+/// 文本里写明了身份，就没必要再去猜。
+#[test]
+fn tmdb_id_evidence_priority_explicit_then_stored_then_text() {
+    // 1) 显式指定最高：即使其它三处都有值也以它为准
+    assert_eq!(
+        tmdb_id_from_evidence(Some(1), Some(2), Some("x.tmdb-3.mkv"), "y tmdb-4"),
+        Some(1)
+    );
+    // 2) 入库时解析出来的次之
+    assert_eq!(
+        tmdb_id_from_evidence(None, Some(2), Some("x.tmdb-3.mkv"), "y tmdb-4"),
+        Some(2)
+    );
+    // 3) 都没有才从文本现解析，且**文件名优先于标题**
+    assert_eq!(
+        tmdb_id_from_evidence(None, None, Some("x.tmdb-3.mkv"), "y tmdb-4"),
+        Some(3)
+    );
+    // 4) 只有标题里有
+    assert_eq!(
+        tmdb_id_from_evidence(None, None, Some("没线索.mkv"), "y tmdbid:4"),
+        Some(4)
+    );
+    // 5) 都没有 → None，交给原有流程（标题 + 年份检索）
+    assert_eq!(
+        tmdb_id_from_evidence(None, None, Some("言叶之庭.2013.mkv"), "言叶之庭"),
+        None
+    );
+    assert_eq!(tmdb_id_from_evidence(None, None, None, "言叶之庭"), None);
+}
+
+/// 防误伤：`2012` / `1080p` 这类普通数字不会被当成身份线索。
+#[test]
+fn tmdb_id_evidence_ignores_plain_numbers() {
+    assert_eq!(
+        tmdb_id_from_evidence(None, None, Some("2012.2009.1080p.mkv"), "2012"),
+        None
+    );
+    assert_eq!(
+        tmdb_id_from_evidence(None, None, Some("Se7en.1995.x264.mkv"), "Se7en"),
+        None
+    );
 }

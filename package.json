@@ -5,17 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:server": "node scripts/dev-server.mjs",
+    "dev:server": "node mjs/dev/dev-server.mjs",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/run-tests.mjs",
-    "test:watch": "node scripts/run-tests.mjs --watch",
+    "test": "node mjs/dev/run-tests.mjs",
+    "test:watch": "node mjs/dev/run-tests.mjs --watch",
     "preview": "vite preview",
     "tauri": "tauri",
-    "package": "node scripts/package.mjs",
-    "package:gz": "node scripts/package.mjs --format gz",
-    "package:dry": "node scripts/package.mjs --dry",
-    "verify:delta": "node scripts/verify-delta.mjs"
+    "package": "node mjs/build/package.mjs",
+    "package:gz": "node mjs/build/package.mjs --format gz",
+    "package:dry": "node mjs/build/package.mjs --dry",
+    "verify:delta": "node mjs/build/verify-delta.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

@@ -165,8 +165,32 @@ lazy_re!(re_season_short, r"(?i)\bs(\d{1,2})\b");
 lazy_re!(re_episode_word, r"(?i)\bepisodes?[\s\-_.]*(\d{1,3})\b");
 lazy_re!(re_ep_en, r"(?i)\b(?:ep|e)[\s\-_.]*(\d{1,3})\b");
 lazy_re!(re_year, r"\b(18\d{2}|19\d{2}|20\d{2})\b");
-lazy_re!(re_tmdb, r"(?i)tmdb[\-_=]?\s*(\d{3,})");
+// TMDB 识别码：`tmdb-123456` / `tmdbid:123456` / `[tmdb=123456]` / `(tmdb 123456)`。
+//
+// 两条硬要求：
+// 1. **必须有 `tmdb`（或 `tmdbid`）关键字**——否则 `2012`、`1080p` 这类
+//    名称本身带数字的普通文本会被误当成 id；
+// 2. 结尾的 `\b` 挡掉分辨率伪装：`tmdb 1080p` 里的 `1080` 后面紧跟 `p`，
+//    没有词边界，不会被认成 id；
+// 3. 位数锁 1–10 位：TMDB id 确实有 1–2 位的老片（`tmdb-7`），
+//    但不会有 10 位以上，上限用来挡 `tmdb-12345678901234` 这种乱写。
+lazy_re!(re_tmdb, r"(?i)\btmdb(?:\s*id)?[\s\-_=:.]*(\d{1,10})\b");
 lazy_re!(re_dash_ep, r"[\-–—]\s*(\d{2,3})\s*$");
+// `剧名.01.猴王初问世`：中文库最常见的「裸集号 + 集名」写法。
+//
+// 三条阀门，缺一条就会误伤电影：
+// 1. 位数锁 2–3 位：躲开 4 位年份（`1986`）与 `XX 2` 这种单数字续作；
+// 2. 后边界必须是 ASCII 分隔符，且**后面还得有内容**——`50度灰` `300勇士`
+//    `12怒汉` 这类片名的数字后面紧跟汉字，落不到这条规则上；
+// 3. 只认「集号后面还有集名」的形态。`剧名 01.mkv`（数字结尾）**不在这里认**，
+//    留给判定层的「目录编号共识」处理——系列电影正是这个形状，
+//    单个文件就判成剧集会把 `Rocky 1/2` 那类拆部电影误收进剧集。
+lazy_re!(
+    re_bare_ep,
+    r"(?:^|[\s._\-–—\[\](){}]|[\x{4e00}-\x{9fff}])(\d{2,3})(?:[\s._\-–—\[\](){}])(\S)"
+);
+// `1986-2000版`：发行版本区间，不属于标题，取**起始年**。
+lazy_re!(re_year_range, r"(\d{4})\s*[-–—~]\s*(\d{4})\s*(?:版本|年版|版)?");
 
 // 注意：这里必须是**单行**字面量。Rust 原始字符串不支持行尾反斜杠续行，
 // 换行会被当成模式的一部分，导致被折行的那几个标签永远匹配不上。
@@ -253,6 +277,11 @@ fn first_se_index(s: &str) -> Option<usize> {
             consider(m.start());
         }
     }
+    // 裸集号的前边界是**被匹配吃掉**的一个分隔符或汉字（`剧名01.集名`），
+    // 用它当截断点会连剧名最后一个字一起切掉，这里只取数字本身的位置。
+    if let Some(m) = re_bare_ep().captures(s).and_then(|c| c.get(1)) {
+        consider(m.start());
+    }
     best
 }
 
@@ -303,6 +332,31 @@ fn clean_title(s: &str) -> String {
 }
 
 /// 解析文件名（可含扩展名），返回结构化结果。
+/// 从任意文本里提取 TMDB 识别码。
+///
+/// 这是「文本 → TMDB id」的**唯一解析入口**：文件名、标题、目录名都走这里，
+/// 规则只写一份，避免各处各写一条正则、彼此对不上。
+///
+/// 只认带 `tmdb`（或 `tmdbid`）关键字的写法，大小写与分隔符一律忽略：
+/// `tmdb-123456` / `tmdbid:123456` / `[tmdb=123456]` / `(tmdb 123456)` /
+/// `tmdb_123456` / `TMDB.123456` 都能命中。
+/// **没有关键字的裸数字一律不算**，所以 `2012`、`1080p`、`第01集` 不会被误伤。
+pub fn extract_tmdb_id(text: &str) -> Option<i64> {
+    let norm = normalize_separators(text);
+    re_tmdb()
+        .captures(&norm)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<i64>().ok())
+}
+
+/// 按给定顺序依次在多个文本里找 TMDB 识别码，命中第一个就返回。
+///
+/// **顺序即优先级**：调用方把最可信的文本放前面
+/// （通常是「原始文件名」优先于「清洗后的标题」）。
+pub fn tmdb_id_from_texts(texts: &[&str]) -> Option<i64> {
+    texts.iter().filter_map(|t| extract_tmdb_id(t)).next()
+}
+
 pub fn parse_file_name(file_name: &str) -> ParsedName {
     let stem = match file_name.rfind('.') {
         Some(i) if !file_name[i + 1..].contains(' ') => &file_name[..i],
@@ -316,10 +370,10 @@ pub fn parse_stem(stem: &str) -> ParsedName {
     let norm = normalize_separators(stem);
     let mut result = ParsedName::default();
 
-    // 1) TMDB id：在**未去括号**的串上找，因为标记本身写在 `{tmdb-123}` 里
-    if let Some(c) = re_tmdb().captures(&norm) {
-        result.tmdb_id = c.get(1).and_then(|m| m.as_str().parse::<i64>().ok());
-    }
+    // 1) TMDB id：在**未去括号**的串上找，因为标记本身写在 `{tmdb-123}` 里。
+    //    放在最前面——命中 id 就意味着身份已确定，后面的标题/年份/分辨率
+    //    解析只是为了清洗展示用的标题，不影响匹配依据。
+    result.tmdb_id = extract_tmdb_id(&norm);
 
     // 2) 去掉所有括号组，得到用于识别季/集与标题的干净串
     let det = strip_all_groups(&norm);
@@ -346,6 +400,11 @@ pub fn parse_stem(stem: &str) -> ParsedName {
         result.episode_marker = true;
     } else if let Some(c) = re_dash_ep().captures(&det) {
         // `Show Name - 01`：无季信息，按第 1 季处理
+        result.episode = c.get(1).and_then(|m| m.as_str().parse().ok());
+        result.episode_marker = true;
+    } else if let Some(c) = re_bare_ep().captures(&det) {
+        // `剧名.01.集名`：裸集号 + 集名，同样按第 1 季处理。
+        // 放最后一条——任何**明确**标记（S01E01 / 第01集 / EP01 / -01）都优先。
         result.episode = c.get(1).and_then(|m| m.as_str().parse().ok());
         result.episode_marker = true;
     }
@@ -389,13 +448,29 @@ pub fn parse_stem(stem: &str) -> ParsedName {
         }
         last
     };
-    match year_in(&region) {
-        Some((y, range)) => {
+    // 5a) 版本区间要**先于**单一年份处理：`西游记1986-2000版` 里的 `2000`
+    //     不是上映年份，按 `year_in`「取最后一个年份」的规则会取成 2000。
+    let mut year_done = false;
+    if re_year_range().captures(&region).is_some() {
+        if let Some(y) = re_year_range()
+            .captures(&region)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<i32>().ok())
+        {
             result.year = Some(y);
-            region.replace_range(range, " ");
+            year_done = true;
         }
-        None => {
-            result.year = year_in(&norm).map(|(y, _)| y);
+        region = re_year_range().replace_all(&region, " ").to_string();
+    }
+    if !year_done {
+        match year_in(&region) {
+            Some((y, range)) => {
+                result.year = Some(y);
+                region.replace_range(range, " ");
+            }
+            None => {
+                result.year = year_in(&norm).map(|(y, _)| y);
+            }
         }
     }
 
@@ -406,6 +481,8 @@ pub fn parse_stem(stem: &str) -> ParsedName {
     region = re_episode_word().replace_all(&region, " ").to_string();
     region = re_ep_en().replace_all(&region, " ").to_string();
     region = re_dash_ep().replace_all(&region, " ").to_string();
+    // 注意：`re_bare_ep` **不进**清理列表——它匹配时会吃掉集名的第一个字符
+    // （`(\S)` 是模式的一部分）。标题区域本来就已经截断在它之前，无需再清。
     region = re_season_cn().replace_all(&region, " ").to_string();
     region = re_season_en().replace_all(&region, " ").to_string();
     region = re_season_short().replace_all(&region, " ").to_string();

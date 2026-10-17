@@ -47,6 +47,14 @@ debug = 1
 # 修复/恢复手段始终是：`cargo clean` 后重新构建。
 incremental = false
 
+[profile.release]
+# 去掉符号表 / 调试信息，让发布用的 exe 明显变小。
+#
+# 发版产物是给用户双击运行的成品，现场排障不需要它的符号；
+# panic 的位置由 `main.rs` 的错误信息与日志给出，够定位。
+# 需要带符号排查线上问题时，临时改成 `strip = false` 或 `= "debug"` 重新构建即可。
+strip = true
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }

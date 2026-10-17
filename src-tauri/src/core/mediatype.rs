@@ -130,8 +130,11 @@ impl MediaKind {
 /// 就没必要再猜。
 ///
 /// 目前由 `scrape` 层在应用 TMDB 匹配结果时传入（R1 优先级最高）。
-// 变体还没全部被命令层用到，但这是判定规则的**对外可配置项**，不是死代码。
-#[allow(dead_code)]
+///
+/// ⚠️ R1 在 `classify()` 里是**完全短路**（直接 return，不看其它信号）。
+/// 所以调用方（`commands`）必须先用 `media::apply_source_hint` 过一遍 gate：
+/// `locked` 的条目不动、已经有单集的剧集不动、**禁止「剧集 → 电影」方向**。
+/// 这条限制是刻意不对称的——本项目的历史伤疤就是「大量剧集被误判成电影」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceHint {
     Movie,
@@ -140,12 +143,26 @@ pub enum SourceHint {
 
 impl SourceHint {
     /// 从数据源返回的 `media_type` 字符串解析（认不出来就返回 `None`，不猜）。
+    ///
+    /// 目前只有测试在直接调用它：**本项目的 `SourceHint` 只从可信来源推导**
+    /// （`hint_from_row` 看 `tvdb_id`、NFO 看根元素），不解析自由文本。
+    /// 大模型的输出**刻意不参与类型判定**（B5：它只影响检索词），
+    /// 所以哪怕它给出了 `media_type` 字符串也不会走这里。
+    /// 保留这个函数是给「将来接入新的元数据源返回类型字段」用的。
     #[allow(dead_code)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "movie" | "film" => Some(SourceHint::Movie),
             "tv" | "series" | "show" => Some(SourceHint::Tv),
             _ => None,
+        }
+    }
+
+    /// 转成库里的 `type` 字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceHint::Movie => "movie",
+            SourceHint::Tv => "tv",
         }
     }
 }
@@ -492,6 +509,24 @@ pub fn strip_trailing_number(title: &str) -> &str {
     match title.rsplit_once(' ') {
         Some((head, tail)) if number_token_value(tail).is_some() => head.trim(),
         _ => "",
+    }
+}
+
+/// 剧集**主记录**的展示标题：把解析标题尾部的集号 token 剥掉。
+///
+/// `剧名 01.mkv` 这种写法刻意不被解析器认成集号（留给目录编号共识），
+/// 集号由 `fill_episode_numbers` 从标题尾部找回——但 `" 01"` 若随标题原样
+/// 入库，剧集行就会显示成 `剧名 01`（「大明风华」被显示成「大明风华01」）。
+/// 集号已被单独取走，标题必须把它剥掉；剥完为空（纯编号文件名）时退回
+/// 原标题，交给上游的目录名兜底。年份（1800..2100）与标题自带的数字
+/// （`300勇士`）不是编号 token，不会被误剥。
+pub fn series_title_of(title: &str) -> String {
+    let t = title.trim();
+    let stripped = strip_trailing_number(t);
+    if stripped.is_empty() {
+        t.to_string()
+    } else {
+        stripped.to_string()
     }
 }
 

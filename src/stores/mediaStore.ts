@@ -1,28 +1,34 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { computed, ref, watch } from "vue";
 import {
   cancelScan as apiCancelScan,
   cancelScrape as apiCancelScrape,
   clearLibrary, createMedia as apiCreateMedia,
   deleteEpisodes as apiDeleteEpisodes, deleteMedia, deleteMediaBatch as apiDeleteMediaBatch,
-  getMediaDetail, getMediaList, getMovieCollections as apiGetMovieCollections,
+  getMediaDetail, getMediaList,
   getScanHistory, onScanProgress, onScrapeProgress,
   playMedia, reclassifyMedia as apiReclassify, revealInExplorer,
   scanLibrary, scrapeAll as apiScrapeAll, scrapeMedia,
   updateMedia as apiUpdateMedia,
   importFolder as apiImportFolder, importFolderInto as apiImportFolderInto,
   doubanApply as apiDoubanApply,
+  moveMediaNodes as apiMoveMediaNodes, undoTreeOp as apiUndoTreeOp,
   type CreateMediaInput, type ImportFolderResult, type MediaDetail, type MediaItem,
-  type MovieCollection, type ReclassifyResult,
+  type ReclassifyResult,
   type ScanHistoryItem, type ScanProgress, type ScanStats, type ScrapeProgress,
   type UnlistenFn, type UpdateMediaInput,
 } from "../api/commands";
 import { parseView, type ViewKey } from "../types";
+import { buildHanOrder, rawTitleOf, sortMediaItems, type HanOrder } from "../utils/sort";
+import { resolveClick } from "../utils/selection";
+import { useSettingsStore } from "./settingsStore";
 
 /** 媒体类型筛选；`unknown` = 判定不出来的「待确认」条目。 */
 export type ListFilter = "all" | "movie" | "tv" | "unknown";
 
 export const useMediaStore = defineStore("media", () => {
+  /** 排序偏好在设置里（单向依赖，无环：`stores/settingsStore` 不反向引用本 store）。 */
+  const settings = useSettingsStore();
   const items = ref<MediaItem[]>([]);
   /** 媒体类型筛选（内置入口）。 */
   const filter = ref<ListFilter>("all");
@@ -36,6 +42,15 @@ export const useMediaStore = defineStore("media", () => {
 
   /** 是否处于多选模式（界面上的「选择」开关）。 */
   const selecting = ref(false);
+  /**
+   * 是否处于聚合模式（界面上的「聚合」开关）：封面墙里卡片直接可拖，
+   * 拖到另一张封面上即合并为分组。
+   *
+   * 与 `selecting` **相互独立**：聚合不要求先进「选择」模式，它自己就会把
+   * `selectable` 打开（见 `App.vue` 里 `:selectable` 的绑定）；反过来开着
+   * 聚合也不等于开着多选工具条。
+   */
+  const grouping = ref(false);
   /** 当前选中的条目 id（批量删除用）。 */
   const selected = ref<number[]>([]);
 
@@ -51,11 +66,18 @@ export const useMediaStore = defineStore("media", () => {
   const selectedId = ref<number | null>(null);
   const detail = ref<MediaDetail | null>(null);
 
-  /** 系列电影合集（派生视图，进「系列合集」栏目时才加载）。 */
-  const collections = ref<MovieCollection[]>([]);
-  const loadingCollections = ref(false);
   /** 正在重新识别存量数据。 */
   const reclassifying = ref(false);
+
+  /* ------------------------- 剧集层级（聚合分组） ------------------------- */
+
+  /**
+   * 后端撤销栈还剩几步（`moveNodes` / `undoTree` 回写，撤销入口的置灰依据）。
+   *
+   * 层级数据本身不再单独存一份：剧集层级视图已撤掉，`parent_id` 这层关系
+   * 由封面墙直接从 `items` 里聚合成分组，避免两份数据互相打架。
+   */
+  const undoDepth = ref(0);
 
   /** 批量刮削的实时进度（后台任务推来的最后一个事件）。 */
   const scrapeProgress = ref<ScrapeProgress | null>(null);
@@ -149,8 +171,6 @@ export const useMediaStore = defineStore("media", () => {
     tagId.value = null;
     unclassified.value = false;
     if (parsed.kind === "builtin") {
-      // `collections` 不是「另一种类型」，而是从电影标题算出来的派生视图，
-      // 所以它落在「全部」上，另外单独拉一份合集数据。
       filter.value =
         parsed.key === "movie" || parsed.key === "tv" || parsed.key === "unknown"
           ? parsed.key
@@ -171,38 +191,15 @@ export const useMediaStore = defineStore("media", () => {
     // 留着会让「删除所选」删到看不见的条目。
     selected.value = [];
     await load();
-    // 系列合集是另一份数据（由电影标题算出来），只在切到那个栏目时才算。
-    if (parsed.kind === "builtin" && parsed.key === "collections") {
-      await loadCollections();
-    }
   }
 
-  /* ------------------------------ 系列电影合集 ------------------------------ */
-
-  /**
-   * 加载系列电影合集。
-   *
-   * 后端按「系列基名」把同一 IP 的电影归到一起（按上映时间排序），
-   * 这是**纯派生数据**：改了片名重算一次即可，不动库里任何一行。
-   */
-  async function loadCollections(): Promise<void> {
-    loadingCollections.value = true;
-    error.value = null;
-    try {
-      collections.value = await apiGetMovieCollections();
-    } catch (e) {
-      error.value = String(e);
-      collections.value = [];
-    } finally {
-      loadingCollections.value = false;
-    }
-  }
+  /* ------------------------------ 类型重新识别 ------------------------------ */
 
   /**
    * 重新识别存量数据的类型（修正历史误判）。
    *
-   * 传 `ids` 只重判所选；不传就是全库。结束后刷新列表与合集——
-   * 类型变了，所在栏目和合集归属都会跟着变。
+   * 传 `ids` 只重判所选；不传就是全库。结束后刷新列表——类型变了，
+   * 所在栏目会跟着变。
    */
   async function reclassify(ids?: number[] | null): Promise<ReclassifyResult | null> {
     reclassifying.value = true;
@@ -211,7 +208,6 @@ export const useMediaStore = defineStore("media", () => {
       const r = await apiReclassify(ids ?? null);
       note(r.message);
       await load();
-      if (collections.value.length) await loadCollections();
       return r;
     } catch (e) {
       error.value = String(e);
@@ -234,6 +230,37 @@ export const useMediaStore = defineStore("media", () => {
     else selected.value.push(id);
   }
 
+  /**
+   * Shift 区间的**锚点**：上一次点击的那张。
+   *
+   * 归 store 而不是组件：勾选集合本来就由 store 持有，锚点是它的伴生状态；
+   * 放组件里会在「详情页返回 / 换栏目重挂」时丢掉，中间的 Shift 就没了起点。
+   */
+  const selectAnchor = ref<number | null>(null);
+
+  /**
+   * 多选模式下点击一张卡片（带修饰键）。
+   *
+   * 语义全在 `utils/selection.ts`（纯函数，已单测）：
+   * - 普通点击 / Ctrl·Cmd+点击 → 切换这一张；
+   * - **Shift+点击** → 把「上次点的那张 → 这一张」在当前可见顺序里的整段**并入**选中。
+   *
+   * 区间用的是 `visibleItems()`（**当前看得见的顺序**），不是全库顺序 ——
+   * 用户划的区间永远基于屏幕上那一段，换栏目 / 敲了关键字之后的顺序才对得上。
+   */
+  function selectWithMods(id: number, mods: { shift?: boolean; ctrl?: boolean; meta?: boolean }): void {
+    const order = visibleItems().map((i) => i.id);
+    const r = resolveClick({
+      order,
+      selected: selected.value,
+      anchor: selectAnchor.value,
+      id,
+      mods,
+    });
+    selected.value = r.selected;
+    selectAnchor.value = r.anchor;
+  }
+
   /** 全选 / 取消全选：作用范围是**当前可见**的条目（关键字过滤后看到的）。 */
   function toggleSelectAll(): void {
     const visible = visibleItems();
@@ -243,8 +270,22 @@ export const useMediaStore = defineStore("media", () => {
         : visible.map((i) => i.id);
   }
 
+  /**
+   * 反选：把**当前可见**条目里的选中状态整个翻过来。
+   *
+   * 作用范围与 `toggleSelectAll` 一致——只看得见的那些。否则用户按一下反选，
+   * 会把关键字过滤掉的一大批看不见的条目也选进来，点「删除所选」就误删了。
+   */
+  function invertSelection(): void {
+    const visible = visibleItems().map((i) => i.id);
+    const picked = new Set(selected.value);
+    selected.value = visible.filter((id) => !picked.has(id));
+  }
+
   function clearSelection(): void {
     selected.value = [];
+    // 锚点必须跟着清：留着它，下一次 Shift 会从一个用户早就取消掉的起点算区间。
+    selectAnchor.value = null;
   }
 
   /**
@@ -258,22 +299,71 @@ export const useMediaStore = defineStore("media", () => {
   }
 
   /**
-   * 批量删除选中的条目。
+   * 从选中集合里剔除一批 id。
    *
-   * 后端一个事务删完并返回真实条数；这里据此提示，并刷新列表持久化状态。
-   * 若详情页正开着被删掉的条目，一并返回列表页。
+   * 删完之后必须调用：留在 `selected` 里的已删 id 会让下一次「删除所选」
+   * 带着一批已经不存在的 id 再跑一趟，界面上的计数也就对不上了。
+   */
+  function dropFromSelection(ids: number[]): void {
+    if (!ids.length) return;
+    const gone = new Set(ids);
+    selected.value = selected.value.filter((id) => !gone.has(id));
+  }
+
+  /**
+   * 把选中集合里**当前看不见**的条目剔除。
+   *
+   * 换栏目时是整体清空（见 `setView`），改关键字则只剔掉被过滤掉的那部分——
+   * 否则「删除所选」按钮数的是 `selected.length`，而列表里只显示过滤后的几条，
+   * 用户点下去会删掉一批自己根本看不见的条目，这是最典型的误删。
+   */
+  function pruneSelection(): void {
+    if (!selected.value.length) return;
+    const alive = new Set(visibleItems().map((i) => i.id));
+    selected.value = selected.value.filter((id) => alive.has(id));
+  }
+
+  /** 丢掉重复项与非法的 id（后端会再做一遍，这里先做是为了让提示的条数准）。 */
+  function cleanIds(ids: number[]): number[] {
+    return [...new Set(ids.filter((id) => Number.isInteger(id) && id > 0))];
+  }
+
+  /**
+   * 批量删除指定 id —— **删除的唯一真正入口**（批量删除走这里）。
+   *
+   * 后端一个事务删完并返回**真实条数**；这里据此提示并刷新列表。
+   * 不吞异常：失败交给调用方转成界面提示。
+   */
+  async function removeByIds(ids: number[]): Promise<number> {
+    const want = cleanIds(ids);
+    if (!want.length) return 0;
+    const n = await apiDeleteMediaBatch(want);
+    if (n < want.length) {
+      // 后端是单事务，要么全成要么全败；条数变少只可能是「有些 id 已经不在库里」
+      // （别处刚删过 / 手快点了两次）。这不是失败，但必须说清楚，
+      // 否则用户会以为有一批没删掉、于是再点一次。
+      note(`已删除 ${n} 条资源，另有 ${want.length - n} 条已不在库中`);
+    } else {
+      note(`已删除 ${n} 条资源`);
+    }
+    if (selectedId.value !== null && want.includes(selectedId.value)) closeDetail();
+    // 删掉的和本来就不存在的都要剔除，不能只剔 n 条
+    dropFromSelection(want);
+    await load();
+    return n;
+  }
+
+  /**
+   * 批量删除**当前选中的**条目。
+   *
+   * 真正的删除逻辑在 `removeByIds`，这里只负责取选中集合 + 把失败转成提示。
    */
   async function removeSelected(): Promise<number> {
     const ids = [...selected.value];
     if (!ids.length) return 0;
     error.value = null;
     try {
-      const n = await apiDeleteMediaBatch(ids);
-      note(`已删除 ${n} 条资源`);
-      if (selectedId.value !== null && ids.includes(selectedId.value)) closeDetail();
-      clearSelection();
-      await load();
-      return n;
+      return await removeByIds(ids);
     } catch (e) {
       error.value = String(e);
       note("批量删除失败：" + String(e));
@@ -363,11 +453,16 @@ export const useMediaStore = defineStore("media", () => {
    * 只删传入的单集 id，其他剧目不受影响；删完同步刷新详情与列表（集数变了）。
    */
   async function removeEpisodes(mediaId: number, ids: number[]): Promise<number> {
-    if (!ids.length) return 0;
+    const want = cleanIds(ids);
+    if (!want.length) return 0;
     error.value = null;
     try {
-      const n = await apiDeleteEpisodes(ids);
-      note(`已删除 ${n} 条资源`);
+      const n = await apiDeleteEpisodes(want);
+      note(
+        n < want.length
+          ? `已删除 ${n} 条资源，另有 ${want.length - n} 条已不在库中`
+          : `已删除 ${n} 条资源`,
+      );
       await openDetail(mediaId);
       await load();
       return n;
@@ -497,6 +592,33 @@ export const useMediaStore = defineStore("media", () => {
   }
 
   /**
+   * 刮削**指定**的一批条目（多选工具条里的「刮削所选」）。
+   *
+   * 与 `scrapeMissing` 的区别：那个是「缺海报的都来一遍」的后台任务，
+   * 这里刮的是用户亲手勾选的几条，逐条走 `scrape`，最后给一句汇总。
+   */
+  async function scrapeIds(ids: number[]): Promise<void> {
+    if (!ids.length) return;
+    error.value = null;
+    let ok = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        const r = await scrapeMedia(id, null);
+        if (r.ok) ok += 1;
+        else failed += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    await load();
+    note(`刮削所选完成：成功 ${ok} 条${failed ? `，失败 ${failed} 条` : ""}`);
+    if (failed > 0 && ok === 0) {
+      error.value = "所选条目都刮削失败了，请检查 TMDB API Key 与网络";
+    }
+  }
+
+  /**
    * 批量刮削缺海报的条目。
    *
    * 命令只是「起任务」并立即返回，真正的抓取在后台线程，
@@ -558,10 +680,13 @@ export const useMediaStore = defineStore("media", () => {
   async function remove(id: number): Promise<void> {
     try {
       await deleteMedia(id);
+      // 这条可能同时在多选集合里，不剔掉的话下一次「删除所选」会带着它再跑一趟
+      dropFromSelection([id]);
       closeDetail();
       await load();
       note("已从媒体库移除");
     } catch (e) {
+      // 后端删不到会明确报错（不存在 / 已被删过），原样说给用户，不要谎报成功
       note("移除失败：" + String(e));
     }
   }
@@ -578,29 +703,120 @@ export const useMediaStore = defineStore("media", () => {
     }
   }
 
-  /** 关键字过滤后的列表。 */
+  /**
+   * 当前列表里出现过的汉字 → 拼音秩（**只依赖 `items`**）。
+   *
+   * 拼音秩是按「这批数据里实际出现的汉字」现算的，所以 `items` 一变就得重算；
+   * 好在不依赖关键字与排序方向——敲搜索框不会触发它重算。
+   */
+  const hanOrder = computed<HanOrder>(() => buildHanOrder(items.value.map(rawTitleOf)));
+
+  /**
+   * 排序后的全量列表：`sort(已识别) ++ sort(未识别)`。
+   *
+   * 必须是 `computed`：`visibleItems()` 一次渲染会被调用七八次
+   * （`:items` / 全选计数 / 按钮 disabled / 全选判等 / store 内三个裁剪入口），
+   * 把排序塞进函数体就等于一次渲染排七遍。
+   */
+  const orderedItems = computed<MediaItem[]>(() =>
+    sortMediaItems(items.value, settings.sortBy, settings.sortDir, hanOrder.value));
+
+  /**
+   * 移动一批剧集（封面墙的拖拽聚合 / 解除分组落点）。
+   *
+   * 成功后**保留选中**：用户刚拖完的那几项通常还要接着操作（再拖、打开详情），
+   * 清掉勾选等于逼他重新选一遍。
+   *
+   * 这里**不重拉列表**：`parent_id` 变了但 `items` 里的行没变，重拉的时机由
+   * 调用方决定（封面墙要立刻重画分组，所以在 `App.vue` 里跟着 `load()`）。
+   */
+  async function moveNodes(
+    ids: number[],
+    targetParentId: number | null,
+    index?: number | null,
+  ): Promise<boolean> {
+    if (!ids.length) return false;
+    error.value = null;
+    try {
+      const res = await apiMoveMediaNodes({ ids, targetParentId, index });
+      undoDepth.value = res.undo_depth;
+      note(res.message);
+      return true;
+    } catch (e) {
+      // 后端整批在一个事务里，失败即回滚；这里只是把原因说清楚
+      error.value = String(e);
+      note(String(e));
+      return false;
+    }
+  }
+
+  /**
+   * 撤销最后一次层级操作。
+   *
+   * 撤销会改回 `parent_id`，所以必须重拉列表——否则封面墙上的分组
+   * 还停在撤销前的样子，用户会以为没生效。
+   */
+  async function undoTree(): Promise<boolean> {
+    error.value = null;
+    try {
+      const res = await apiUndoTreeOp();
+      undoDepth.value = res.undo_depth;
+      note(res.message);
+      await load();
+      return true;
+    } catch (e) {
+      error.value = String(e);
+      note(String(e));
+      return false;
+    }
+  }
+
+  /**
+   * 关键字过滤后的列表。
+   *
+   * 过滤发生在**排序之后**：排序是一次全量计算（挂在 `orderedItems` 上），
+   * 敲关键字只做一遍 O(n) 的字符串匹配，不会每按一次键就重排一次。
+   */
   function visibleItems(): MediaItem[] {
     const kw = keyword.value.trim().toLowerCase();
-    if (!kw) return items.value;
-    return items.value.filter((it) => {
-      const hay =
-        `${it.display_title} ${it.title} ${it.genre ?? ""} ${it.year ?? ""}`.toLowerCase();
+    if (!kw) return orderedItems.value;
+    return orderedItems.value.filter((it) => {
+      // 与后端 LIST_WHERE 的检索口径一致：标题 / 原名 / 类型 / 年份 / 目录名。
+      // 少了 original_title 时，用英文原名（刮削前的文件名标题）会一条都搜不到。
+      // 注意：toLowerCase 必须包住整个拼接结果——`.toLowerCase()` 只作用于
+      // 紧邻的那个模板串，拼到前面去的 display_title 不会被降成小写。
+      const hay = (
+        `${it.display_title} ${it.title} ${it.original_title ?? ""} ` +
+        `${it.group_key ?? ""} ${it.genre ?? ""} ${it.year ?? ""}`
+      ).toLowerCase();
       return hay.includes(kw);
     });
   }
+
+  /**
+   * 关键字一变就剔掉被过滤掉的选中项。
+   *
+   * 放在这里（而不是 store 顶部）是因为回调要用到 `visibleItems`，
+   * 而它的定义必须在前——`watch` 的声明位置是有语义的，别往上挪。
+   */
+  watch(keyword, () => pruneSelection());
 
   return {
     items, filter, keyword, categoryId, tagId, unclassified,
     loading, scanning, scraping, error, toast,
     lastScan, scanHistory, selectedId, detail, scrapeProgress, scanProgress,
-    selecting, selected,
-    collections, loadingCollections, reclassifying,
+    selecting, grouping, selected,
+    hanOrder, orderedItems,
+    reclassifying,
     load, setFilter, setView, createItem, updateItem, scan, cancelScan, loadHistory,
     openDetail, closeDetail,
-    scrape, scrapeMissing, cancelScrape, play, reveal, remove, clearAll,
+    scrape, scrapeMissing, cancelScrape, scrapeIds, play, reveal, remove, clearAll,
     visibleItems, note,
     isSelected, toggleSelect, toggleSelectAll, clearSelection, setSelected, removeSelected,
-    importFolder, importFolderInto, removeEpisodes, loadCollections, reclassify,
+    selectWithMods, selectAnchor,
+    pruneSelection, dropFromSelection, removeByIds, invertSelection,
+    importFolder, importFolderInto, removeEpisodes, reclassify,
+    undoDepth, moveNodes, undoTree,
     scrapeDouban,
   };
 });

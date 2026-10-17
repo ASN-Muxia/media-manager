@@ -5,10 +5,13 @@
 // 用手写的解析器来反向验证，等于给 ZIP 规范做了一次独立复核。
 import { describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { basename, join } from "node:path";
 import zlib from "node:zlib";
 import {
-  buildTarGz, buildZip, crc32, dosTime, gitignoreToRegex, isIgnoredByGitignore, tarHeader,
-} from "./package.mjs";
+  DEFAULT_ROOT, buildTarGz, buildZip, crc32, dosTime, gitignoreToRegex, isIgnoredByGitignore,
+  tarHeader,
+} from "../build/package.mjs";
 
 const enc = (s) => Buffer.from(s, "utf8");
 
@@ -219,5 +222,24 @@ describe("打包脚本：tar.gz 容器", () => {
     seen.forEach((x, i) => expect(x.data.equals(SAMPLES[i].data)).toBe(true));
     // 结尾必须是两个空块
     expect(tar.subarray(p, p + 1024).every((b) => b === 0)).toBe(true);
+  });
+});
+
+// 脚本被搬过家（scripts/ -> mjs/build/）。根路径是靠 import.meta.url 上溯算出来的，
+// 目录层级一变就会静默算错：表现不是报错，而是「打包出来的条目数突然只剩几个」——
+// 冒烟脚本照样退出 0，只有盯着条目数才能发现。这里把根路径钉死在项目根。
+describe("打包脚本：根目录推导", () => {
+  it("DEFAULT_ROOT 必须是项目根，不能停在 mjs/ 这类中间目录", () => {
+    // 旧路径做不到：脚本原先在 scripts/ 下只上溯一级，搬到 mjs/build/ 后
+    // 仍只上溯一级就会停在 <项目根>/mjs，只能装进 5 个 .mjs（约 40 KB）。
+    expect(basename(DEFAULT_ROOT)).not.toBe("mjs");
+    expect(basename(DEFAULT_ROOT)).not.toBe("build");
+  });
+
+  it("DEFAULT_ROOT 下应能找到项目根的标志性文件", () => {
+    expect(existsSync(join(DEFAULT_ROOT, "package.json"))).toBe(true);
+    expect(existsSync(join(DEFAULT_ROOT, ".gitignore"))).toBe(true);
+    expect(existsSync(join(DEFAULT_ROOT, "vite.config.ts"))).toBe(true);
+    expect(existsSync(join(DEFAULT_ROOT, "src-tauri", "Cargo.toml"))).toBe(true);
   });
 });
